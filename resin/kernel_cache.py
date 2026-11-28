@@ -10,6 +10,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -25,6 +26,7 @@ from blake3 import blake3
 _SCHEMA_VERSION = 2
 _DEFAULT_RECORD_SUFFIX = ".resin-cache.json"
 _T = TypeVar("_T")
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +39,14 @@ class ArtifactRecord:
     artifact: str
     size: int
     blake3: str
+
+
+class CorruptCacheError(RuntimeError):
+    """A present cache artifact whose readiness record disagrees with its bytes.
+
+    Raised (under the builder lock) instead of silently rebuilding, so a corrupt entry is named with
+    its path and the exact mismatch (size, BLAKE3, identity, ...) and can be removed individually.
+    """
 
 
 class ArtifactCache:
@@ -130,6 +140,64 @@ class ArtifactCache:
                 size=size,
                 blake3=digest,
             )
+        )
+
+    def _raise_if_corrupt(self, artifact_path: Path, *, identity: str) -> None:
+        """Raise a named error if a present artifact's readiness record disagrees with its bytes.
+
+        Called only under the builder lock, where no publish can interleave: an absent artifact or an
+        absent record is a normal miss (the caller builds), but a present record that does not describe
+        the present bytes is corruption. The error names the entry and exactly how it failed so the bad
+        record can be inspected and removed individually, rather than deleting the whole cache blind.
+        """
+
+        if not artifact_path.is_file():
+            return
+        record_path = artifact_path.with_name(f"{artifact_path.name}{self._record_suffix}")
+        if not record_path.is_file():
+            return
+        try:
+            raw_record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            # An unreadable record is an incomplete publication (e.g. a killed builder), not corruption of
+            # committed bytes: name it loudly, then fall back to building (the self-healing contract).
+            _log.warning(
+                "cache: %s: readiness record %s is unreadable (%s); rebuilding this entry",
+                artifact_path, record_path.name, error,
+            )
+            return
+        if not isinstance(raw_record, dict):
+            _log.warning(
+                "cache: %s: readiness record %s is not a JSON object; rebuilding this entry",
+                artifact_path, record_path.name,
+            )
+            return
+        size, digest = _fingerprint(artifact_path)
+        try:
+            relative = artifact_path.relative_to(self._root).as_posix()
+        except ValueError:
+            relative = artifact_path.name
+        expected = asdict(
+            ArtifactRecord(
+                schema=_SCHEMA_VERSION,
+                abi=self._abi,
+                identity=identity,
+                artifact=relative,
+                size=size,
+                blake3=digest,
+            )
+        )
+        if raw_record == expected:
+            return
+        diffs = []
+        for field in ("schema", "abi", "identity", "artifact", "size", "blake3"):
+            want, got = expected[field], raw_record.get(field)
+            if want != got:
+                diffs.append(f"{field}: record={got!r} actual={want!r}")
+        raise CorruptCacheError(
+            f"{artifact_path}: corrupt cache entry — readiness record disagrees with the artifact "
+            f"({'; '.join(diffs)}). Inspect/remove this entry (artifact + {record_path.name}) to rebuild "
+            f"it; the rest of the cache is unaffected."
         )
 
     def publish(
@@ -250,6 +318,10 @@ class ArtifactCache:
                 with self._stats_lock:
                     self._hits += 1
                 return load(artifact_path)
+            # Under the builder lock no concurrent publish can interleave, so a present artifact whose
+            # readiness record disagrees with its bytes is genuine corruption, not a publication race:
+            # name it and how it failed instead of silently rebuilding over the evidence.
+            self._raise_if_corrupt(artifact_path, identity=identity)
             with self._stats_lock:
                 self._misses += 1
             result = build()

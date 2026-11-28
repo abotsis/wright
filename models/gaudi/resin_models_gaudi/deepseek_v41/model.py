@@ -22,6 +22,8 @@ Engram hash ids are computed on the host from each row's last tokens (``Row.befo
 
 from __future__ import annotations
 
+import os
+import os as _os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -33,6 +35,7 @@ from resin.models.deepseek_v41 import DeepSeekV41Config
 from resin_models_gaudi.common.sampling import PARAMS, TOP_MAX
 from resin_models_gaudi.deepseek_v41 import layers as L
 from resin_models_gaudi.deepseek_v41.cache import (
+    CMP_PAGE_ROWS,
     HISTORY_TOKENS,
     INDEX_ROWS,
     PAGE_ROWS,
@@ -74,6 +77,8 @@ GATHER_T = 16
 TMAX = PREFILL_BUCKETS[-1]
 QUERY_BLOCK = 128  # prefill columns per window slot
 INDEX_KEYS = 2048  # index keys per index slot
+SPARSE_BATCH = 64  # columns per sparse query-block batch: the compact (kc, batch) staging bounds the OOM term
+IX_CHAIN_G = 8  # tiles per bucketed index-chain recipe: ceil(tiles/G) launches carry one device-resident top-512
 PREFILL_IX_SLOTS = 16
 PREFILL_IX_PARTS = 4  # a prefill index launch's slots in parts (index_score_graph)
 # a prefill step whose every column sees more than PREFILTER_MIN entries picks each column's top 512 from the
@@ -100,7 +105,16 @@ _R_COLUMN = 7  # the column whose logits a one-column head gathers
 _R_DENSE = {1: 8, 2: 9}
 _R_PF = {1: 10, 2: 11}
 _REGISTERS = 12
-WORKSPACE_RESERVE = 3 << 30
+# Bytes kept out of the arena for the step tables and the recipes' workspaces. A recipe compiles with its own
+# workspace on the card and keeps it: after the 281 graphs of this model compile, 6.3 GiB of a card's free memory
+# is gone (measured: 20.2 GiB free at attach, 13.9 GiB left after the compile), and it stays gone for the process.
+# So the reserve has to cover that 6.3 GiB as well as the step's own scratch; at 5 GiB a cold recipe cache sizes
+# the arena into memory the compile is holding and the arena allocation fails. 7 GiB leaves ~1.3 GiB of slack.
+WORKSPACE_RESERVE = 7 << 30
+# Diagnostic: RESIN_DS41_WINDOW_ONLY=1 makes every layer a window-only layer -- no compressed KV, no index
+# chain, no compressor -- which splits "the answer is garbage" into "the compressed path" vs "everything
+# else" in one boot.  It is a probe, never a serving configuration.
+WINDOW_ONLY = bool(os.environ.get("RESIN_DS41_WINDOW_ONLY"))
 # the sampler's outputs for up to MAX_T columns: tokens, logprobs, top ids, top logprobs (256-byte aligned)
 _SAMPLED = {
     "tok_out": 0,
@@ -172,9 +186,16 @@ class Shape:
         return 384 if self.prefill else 256
 
     @property
+    def blocks(self) -> int:
+        """query blocks of the step: one per row when decoding, ``qb`` columns each when prefilling"""
+        return self.T // self.qb
+
+    @property
     def ix_slots(self) -> int:
-        """index slots per launch (decode: fewer launches for wider steps)"""
-        return PREFILL_IX_SLOTS if self.prefill else 32 if self.T >= 4 else 16
+        """index slots per launch (decode: fewer launches for wider steps); at most eight blocks' worth, so a
+        launch covers whole tiles of a merge group and the group stays inside ix_thr's vector window"""
+        slots = PREFILL_IX_SLOTS if self.prefill else 32 if self.T >= 4 else 16
+        return min(slots, 8 * self.blocks)
 
     @property
     def groups2(self) -> int:
@@ -237,6 +258,11 @@ class _Tables:
             add(f"rows.{layer}", i32, T, 8)
         for layer in range(layers):
             add(f"lat.{layer}", i32, shape.win_slots, shape.win_keys // PAGE_TOKENS)
+        # the bounded attention stream's window gather tables: per-column visible key count (field 4 = klen)
+        # and each layer's GLOBAL positional window page table (win_pos[pos>>7] = first latent arena row)
+        add("wslots", i32, T, 8)
+        for layer in range(layers):
+            add(f"win_pos.{layer}", i32, model.pages)
         if (
             model.stages and not shape.prefill
         ):  # a draft step's block keys, their slots, the anchors
@@ -253,21 +279,24 @@ class _Tables:
         add("ix_visb", i32, T)
         add("ix_visb2", i32, T)
         add("ix_visc", i32, T)
-        for j in range(model.ixc_launches(shape)):
-            add(f"ixc.{j}", i32, shape.ix_slots, 8)
+        # the sparse arm's per-batch slot records (relative columns within each query-block batch), flat:
+        # batch b, launch j is at record (b*ixc_launches + j)*ix_slots
+        add("ixsc.rec", i32, model.ixsc_batches(shape) * model.ixc_launches(shape) * shape.ix_slots, 8)
+        # (T, 2): each query block's first position and the entries its last column sees (the graph tensor is
+        # (2, T): lane 0 the position, lane 1 the count). Everything the tiled index chain needs per *group* is
+        # derived from this and ix_vis on the device (ds_ix_gslot, ix_gvis, ds_ix_bmax, ix_cmask, ds_ix_merge),
+        # so the fill's index work is O(T) rather than groups x T.
+        add("blk1", i32, T, 2)
+        add("blk2", i32, T, 2)
         for r in (1, 2):
             add(f"ix_vis{r}", i32, T)
             add(f"cmp_blocks{r}", i32, T, model.pages)
-            for j in range(model.ix_launches(shape, r)):
-                add(f"ix{r}.{j}", i32, shape.ix_slots, 8)
-                for o in geo.owners:
-                    if model.cfg.compress_ratios[o] == r:
-                        add(
-                            f"ix{r}.{j}.{o}",
-                            i32,
-                            shape.ix_slots,
-                            INDEX_KEYS // PAGE_TOKENS,
-                        )
+            # the bucketed chain's per-TILE slot records (one slot per query block, lane 7: the tile's first
+            # index page) and per-tile first keys: ix_tiles_padded tiles so every G-tile recipe binds whole ranges
+            add(f"ix{r}.rec", i32, model.ix_rec_stride(shape) * model.ix_tiles_padded(r), 8)
+            # per-tile first key, each tile in its own 256-byte (64 i32) slot so the chain's ix_gb{i} section
+            # base (base + 256*t) is 256-aligned for every tile (sections validate at 256).
+            add(f"ix{r}.gb", i32, model.ix_tiles_padded(r), 64)
         for layer in model.engram_layers:
             if model.engram == "host":
                 add(f"eg.{layer}", f32, T, 256 * J)
@@ -279,9 +308,31 @@ class _Tables:
         self.layers = layers
         self.v: list[dict[str, np.ndarray]] = []
         # byte ranges _fill zeroes: all but the tables it writes whole
+        # tables written whole, so the fill does not zero them: the compressed-page tables, and the index
+        # chain's per-group records and group bases (ds_ix_gslot writes every group of both on the device)
         whole = sorted(
             (self.off[n], self.off[n] + 4 * int(np.prod(self.spec[n][1])))
-            for n in ("cmp_blocks1", "cmp_blocks2")
+            for n in (
+                "cmp_blocks1", "cmp_blocks2",
+                "ix1.rec", "ix2.rec", "ix1.gb", "ix2.gb",
+                *(f"win_pos.{layer}" for layer in range(layers)),
+                # and the tables _fill writes whole on every step, so zeroing them is pure cost: the rope
+                # tables and their inverses, the compressor's rope, the per-layer row tables, the compressor's
+                # latches and the visible-key counts. Under host Engram the embedding tables are the rest of
+                # it: 100 MB of a 116 MB prefill image, written whole by the threaded gather
+                # (`engram_gather_threaded`, one column range per worker, all `t` columns; the Rust gate
+                # `engram_gather_host` compares the whole region against its oracle).
+                #
+                # What is left is the tables the fill writes only sometimes or only partly (a prepared step's
+                # tokens, the sparse arm's records, the engram hashes, the query-block and pending-group
+                # tables, the compressor's slots), ~1 MB of a 15.8 MB card-Engram image.
+                # `test_the_fill_leaves_only_zero_ranges_untouched` pins the invariant this rests on: every
+                # byte the fill leaves untouched is either inside `zero` or written by the device.
+                "cs0", "cs1", "cs0_inv", "cs1_inv", "cs_g1", "cs_g2", "ix_vis1", "ix_vis2",
+                *(f"{kind}.{layer}" for kind in ("rows", "lat") for layer in range(layers)),
+                *((f"eg.{layer}" for layer in model.engram_layers) if model.engram == "host" else ()),
+            )  # fmt: skip
+            if n in self.spec
         )
         self.zero, a = [], 0
         for lo, hi in whole:
@@ -311,11 +362,28 @@ class _Tables:
             v[kind] = block[:, : int(np.prod(dims))].reshape(self.layers, *dims)
 
 
+class _IxMergeOp(_Op):
+    """A merge launch, preceded by the copies that place the group's own scores at their rows of the merge buffer.
+
+    The score launches write a (rows, T) tile, whose column stride is ``rows``; the merge buffer's is
+    ``run + rows`` and its rows 0 .. run - 1 are the running candidates. So the tile goes in per column, at rows
+    run .. (rows 0 .. for the first group): T copies of ``rows`` floats, one batched copy on the launch stream,
+    ordered before the merge without a submission of its own."""
+
+    __slots__ = ("copy",)
+
+    def __init__(self, recipe, names, copy) -> None:
+        super().__init__(recipe, names)
+        self.copy = tuple(np.asarray(a, np.uint64) for a in copy)
+
+
 class _Program:
     """Every launch of one step shape, bound once."""
 
     def __init__(self) -> None:
         self.embed: _Op | None = None
+        # the tiled index chain's group tables, one launch per ratio, run once per step before the layers
+        self.ixg: list[_Op] = []
         self.layers: list[dict] = []
         self.head: _Op | None = None
         self.inject: _Op | None = None
@@ -338,6 +406,7 @@ class DeepSeekV41Gaudi:
         layers: int | None = None,
         recipes: RecipeCache | None = None,
         engram: str = "card",
+        engram_prewarm: bool = True,
         gather: bool = True,
         weights: dict[str, int] | None = None,
         barrier: Callable[[], None] | None = None,
@@ -358,6 +427,7 @@ class DeepSeekV41Gaudi:
         self.rank, self.nranks = rank, nranks
         self.n_layers = cfg.num_hidden_layers if layers is None else layers
         self.engram = engram
+        self.engram_prewarm = engram_prewarm
         self.checkpoint = Path(checkpoint)
         self.sl = RankSlices.of(cfg, rank, nranks)
         # DSpark: its stages after the full backbone, drafting blocks of ``block`` tokens
@@ -408,6 +478,8 @@ class DeepSeekV41Gaudi:
         self.w = weights if weights is not None else self._load(barrier)
         log(f"ds41 rank {rank}/{nranks}: weights in {time.time() - t0:.0f} s")
         self.eg_vocab = 0
+        self.eg_host = {}  # host-Engram: layer -> (weight (rows,256) u8, scale (rows,8) u8) mmap views
+        self._eg_host_maps = []  # holds the mappings + views alive for the model's lifetime
         if self.engram_layers and engram == "card":
             self._hash_tables()
             for layer in (
@@ -418,6 +490,8 @@ class DeepSeekV41Gaudi:
                     rows = self.eg_rows_r
                     self.w[f"{key}_r"] = self.w[key] + rank * rows * 6144
                     self.w[f"{key}_r.s"] = self.w[f"{key}.s"] + 4 * rank * rows
+        if self.engram_layers and engram == "host":
+            self._load_host_tables()
         self._buffers()
         self.capacity: int | None = None
         if not defer_cache:
@@ -440,22 +514,19 @@ class DeepSeekV41Gaudi:
         if slab_rows is not None:
             self.geo = self.geo.with_slab_rows(slab_rows)
         device, log = self.device, self.log
+        free = device.memory_info()[0]
         if callable(capacity):
-            capacity = capacity(device.memory_info()[0] - self.workspace_reserve)
+            capacity = capacity(free - self.workspace_reserve)
         self.capacity = capacity
         self.arena_blocks = self.geo.arena_blocks(capacity)
-        if arena is None:
-            self.arena = self._malloc(self.arena_blocks * 1024 * 512)
-            device.memset32(self.arena, 0, self.arena_blocks * 1024 * 128)
-        else:
-            self.arena = arena
+        # the pending state's size and rows are graph shapes too; only its memory is allocated below
         state = self.geo.state_bytes(capacity)
-        self.state = self._malloc(state)
-        device.memset32(self.state, 0, state // 4)
         self.state_rows = state // (4 * STATE_FLOATS)
-        log(
-            f"ds41: cache {capacity} slabs, {self.arena_blocks / 1024 * 0.5:.1f} GiB per card"
-        )
+        # The arena's block count is a graph shape, so the capacity is fixed here -- but the arena itself is
+        # allocated *after* the recipes compile. A recipe compiles with its own workspace on the card (the
+        # largest is 6.6 GiB), and with the arena already resident a cold recipe cache has nowhere to put it:
+        # ``synDeviceMalloc ... status=26``. Compiling first gives every compile the card's free memory, and
+        # the arena is then sized from what is actually left.
         self.tables = {s: _Tables(s, self) for s in self.shapes}
         size = max(t.nbytes for t in self.tables.values())
         self.table = self._malloc(size)
@@ -478,6 +549,26 @@ class DeepSeekV41Gaudi:
         # device event slots: the sampler's staging copies, and the pinned tables' uploads
         self._stage_event, self._host_event = device.event_slots(2), device.event_slots(2)
         self._compile()
+        # the arena and its pending state, from the memory the compiles left
+        arena_bytes = self.arena_blocks * 1024 * 512
+        left = device.memory_info()[0]
+        if arena is None and left < arena_bytes + state:
+            raise RuntimeError(
+                f"ds41: the cache arena of {capacity} slabs needs {arena_bytes / 2**30:.1f} GiB and its "
+                f"state {state / 2**30:.1f} GiB, but {left / 2**30:.1f} GiB is left after the recipes "
+                f"compiled ({free / 2**30:.1f} GiB free at attach): lower the cache or warm the recipe cache"
+            )
+        if arena is None:
+            self.arena = self._malloc(arena_bytes)
+            device.memset32(self.arena, 0, self.arena_blocks * 1024 * 128)
+        else:
+            self.arena = arena
+        self.state = self._malloc(state)
+        device.memset32(self.state, 0, state // 4)
+        log(
+            f"ds41: cache {capacity} slabs, {self.arena_blocks / 1024 * 0.5:.1f} GiB per card "
+            f"({free / 2**30:.1f} GiB free at attach, {left / 2**30:.1f} GiB after the recipes compiled)"
+        )
 
     def _replay_cut(self) -> int:
         """The first ratio-1 layer, when every later layer reads its compressed KV and index keys: the layers
@@ -503,10 +594,16 @@ class DeepSeekV41Gaudi:
 
     @property
     def workspace_reserve(self) -> int:
-        """Bytes kept out of the arena for the step tables and the shared workspace. The workspace grows with
-        the context: a prefill index selection over candidate blocks (index_select_graph, cand "user") holds
-        the masked scores (kmax, TMAX) and the block maxima (kb, TMAX) as f32."""
-        return max(WORKSPACE_RESERVE, 4 * TMAX * (self.kmax + self.kb) + (1 << 30))
+        """Bytes kept out of the arena for the step tables and the shared workspace. The indexer's scores AND
+        block maxima are tiled (the chain keeps a device-resident running top-512 / top-2048), so no term grows
+        with the context as a published (kb, TMAX) array — the candidate block list is bounded (INDEX_BLOCKS, T)."""
+        pairs = max((L.INDEX_RUN + self.ix_rows(s)) * s.T for s in self.shapes)
+        decode = [s for s in self.shapes if not s.prefill]
+        bpairs = max((L.INDEX_BLOCKS + self.ix_tp(s) * L.BLOCK_TILE) * s.T for s in decode)
+        return max(
+            WORKSPACE_RESERVE,
+            8 * pairs + 8 * L.INDEX_RUN * TMAX + 4 * bpairs + (1 << 30),
+        )
 
     def _malloc(self, nbytes: int) -> int:
         address = self.device.malloc(nbytes)
@@ -526,10 +623,22 @@ class DeepSeekV41Gaudi:
         ]
 
     def ixc_launches(self, shape: Shape) -> int:
-        """index launches over candidate entries a decode step of ``shape`` may need (none for prefill)"""
-        if shape.prefill or not self.kc:
+        """index launches over candidate entries ONE query-block batch of ``shape`` may need (the sparse arm: one
+        slot per column per 2048-entry chunk of its candidate blocks). The step runs ixsc_batches such batches, each
+        scoring only its own columns into the bounded (kc, sparse_batch) staging — never the full (kc, T)."""
+        if not self.kc:
             return 0
-        return -(-shape.T * (self.kc // INDEX_KEYS) // shape.ix_slots)
+        return -(-self.sparse_batch(shape) * (self.kc // INDEX_KEYS) // shape.ix_slots)
+
+    def sparse_batch(self, shape: Shape) -> int:
+        """columns per sparse query-block batch (the bounded staging width); 256-byte-aligned column slices"""
+        return min(shape.T, SPARSE_BATCH)
+
+    def ixsc_batches(self, shape: Shape) -> int:
+        """sparse query-block batches a step of ``shape`` runs"""
+        if not self.kc:
+            return 0
+        return -(-shape.T // self.sparse_batch(shape))
 
     def dense(self, s: Shape) -> bool:
         """whether prefill steps of ``s`` have the dense compressed attention (query blocks of 128)"""
@@ -542,28 +651,276 @@ class DeepSeekV41Gaudi:
         return "ix_visb" if cand else "ix_visb2"
 
     def _ix_names(
-        self, s: Shape, ratio: int, j: int, owner: int, head: dict
+        self, s: Shape, ratio: int, j: int, owner: int, head: dict, scratch: bool = False
     ) -> dict[str, int]:
-        """an index launch's tables: its slots and pages, or each part's rows of them"""
-        base = self.table + self.tables[s].off[f"ix{ratio}.{j}"]
-        pages = self.table + self.tables[s].off[f"ix{ratio}.{j}.{owner}"]
+        """an index launch's tables: its slots and pages, or each part's rows of them. Its scores always go to the
+        tile buffer (a (rows, T) tensor, which is what a score launch writes); the merge op's copy places
+        copies each column's rows to their own rows of the group's merge buffer, and a candidate layer's mask
+        writes the group's rows there in place."""
+        base = (
+            self.table
+            + self.tables[s].off[f"ix{ratio}.rec"]
+            + 4 * 8 * s.ix_slots * j
+        )
+        pages = self.table + self.tables[s].off[f"cmp_blocks{ratio}"]
+        tile = self.ix_tile
         recipe = self.r["ix", s]
+        off = {"cmp_blocks": pages, "cmp_loff": self.loff[owner]}
         if "ix_slots" in recipe.persistent:
-            return {**head, "ix_slots": base, "ix_pages": pages}
-        names = dict(head)
+            return {**head, **off, "ix_slots": base, "ix_pages": pages, "ix_score": tile}
+        names = dict(head, **off, ix_score=tile)
         P = sum(n.startswith("ix_slots.p") for n in recipe.persistent)
         Sp = s.ix_slots // P
         for p in range(P):
             names[f"ix_slots.p{p}"] = base + 4 * 8 * Sp * p
-            names[f"ix_pages.p{p}"] = pages + 4 * (INDEX_KEYS // PAGE_TOKENS) * Sp * p
+            names[f"ix_pages.p{p}"] = pages
             names[f"ix_sink.p{p}"] = self.io["ix_sink"] + 256 * p
         return names
 
+    def ix_tp(self, shape: Shape) -> int:
+        """tiles (of ``INDEX_KEYS`` index keys) one merge group covers: a whole number of launches, at most eight,
+        and at most 4 M score floats (the group's merge buffer stays small and its threshold inside ix_thr's
+        vector window)"""
+        q = max(1, shape.ix_slots // max(1, shape.blocks))
+        tp = q
+        while tp * 2 <= 8 and (tp * 2) * INDEX_KEYS * shape.T <= 4 << 20:
+            tp *= 2
+        return tp
+
+    def ix_rows(self, shape: Shape) -> int:
+        """the score rows of one merge group (its tiles)"""
+        return self.ix_tp(shape) * INDEX_KEYS
+
+    def ix_parts(self, shape: Shape) -> int:
+        """Parts of a prefill index launch. Each part's slots table is bound at its own address (``_ix_names``),
+        and a recipe's section base must be 128-byte aligned: a part's table is (8, ix_slots / P) i32, i.e.
+        32 (ix_slots / P) bytes, so P is the largest of PREFILL_IX_PARTS, 2, 1 that leaves a multiple of four
+        slots per part (8 slots per launch with 4 parts is 64 bytes and fails the launch: status=30, "Section is
+        not aligned")."""
+        if not shape.prefill:
+            return 1
+        for p in (PREFILL_IX_PARTS, 2, 1):
+            if shape.ix_slots % p == 0 and (shape.ix_slots // p) % 4 == 0:
+                return p
+        return 1
+
+    def ix_lpg(self, shape: Shape) -> int:
+        """index launches per merge group"""
+        per_tile = max(1, -(-shape.blocks // shape.ix_slots))
+        return max(1, self.ix_tp(shape) * per_tile // max(1, shape.ix_slots // max(1, shape.blocks)))
+
+    def ix_groups(self, shape: Shape, ratio: int) -> int:
+        """merge groups a step of ``shape`` may need for ratio-``ratio`` keys"""
+        chunks = -(-self.kmax // ratio // INDEX_KEYS)
+        return -(-chunks // self.ix_tp(shape))
+
     def ix_launches(self, shape: Shape, ratio: int) -> int:
         """index launches a step of ``shape`` may need for ratio-``ratio`` keys"""
-        chunks = -(-self.kmax // ratio // INDEX_KEYS)
-        blocks = shape.T // shape.qb
-        return -(-blocks * chunks // shape.ix_slots)
+        return self.ix_groups(shape, ratio) * self.ix_lpg(shape)
+
+    def ix_chunks(self, ratio: int) -> int:
+        """index-key tiles (of ``INDEX_KEYS``) the whole context spans at ratio-``ratio``"""
+        return -(-self.kmax // ratio // INDEX_KEYS)
+
+    def ix_chain_recipes(self, ratio: int) -> int:
+        """G-tile bucketed chain recipes a full-context step takes: ceil(tiles / IX_CHAIN_G). Each recipe is one
+        launch carrying the device-resident running top-512, so the plain/candidate arms are O(tiles/G) launches
+        (not one merge per tile) with O(1) host metadata."""
+        return -(-self.ix_chunks(ratio) // IX_CHAIN_G)
+
+    def ix_tiles_padded(self, ratio: int) -> int:
+        """tiles the per-tile gslot builds records for: the recipe count times G (the last recipe's tail tiles
+        are padding the merge masks by ix_vis), so every recipe binds whole G-tile record/gbase ranges"""
+        return self.ix_chain_recipes(ratio) * IX_CHAIN_G
+
+    def ix_rec_stride(self, shape: Shape) -> int:
+        """record columns per tile in the per-tile gslot's table: the query-block count rounded up to a multiple
+        of 8 so each tile's slot-table section base (rec + 32*stride*t) is 256-aligned (sections validate at 256).
+        The chain reads only ``shape.blocks`` slots of it; the gslot's tail columns are padding it never reads."""
+        return -(-shape.blocks // 8) * 8
+
+    def _ix_group_names(
+        self, s: Shape, ratio: int, g: int, head: dict, kind: str
+    ) -> dict:
+        """A merge group's tables: kind "m" the group's merge (its visible rows, the column's visible entries,
+        the group's first key, the running positions and the buffers it reads and writes), "b" its block maxima
+        (at its slice of the published array) with its pin, or "k" its candidate mask."""
+        tb, T, _run = self.tables[s], s.T, L.INDEX_RUN
+        first = g * self.ix_tp(s) * L.BLOCK_TILE
+        names = dict(head)
+        # the group's first key and the column's visible entries: the kernels derive the group's visible rows,
+        # counts and pin from these (the fill writes neither)
+        base = {
+            "ix_vis": self.table + tb.off[f"ix_vis{ratio}"],
+            "ix_gbase": self.table + tb.off[f"ix{ratio}.gb"] + 256 * g,
+        }
+        if kind == "b":
+            names.update(
+                base,
+                ix_tile=self.ix_tile,
+                ix_bmax=self.io["cand_bmax"] + 4 * T * first,
+            )
+        elif kind == "k":  # the mask reads the score launches' tile and writes the group's rows in place
+            names.update(
+                base,
+                ix_tile=self.ix_tile,
+                ix_tile_out=self.ix_tile,
+                ix_bmax=self.io["cand_bmax"] + 4 * T * first,
+                cand_thr=self.io["cand_thr"],
+            )
+        else:
+            names.update(
+                base,
+                ix_merge=self.ix_merge[g % 2],
+                ix_pos=self.ix_pos[g % 2],
+                ix_pos_out=self.ix_pos[1 - g % 2],
+                ix_thr=self.io["ix_thr"] if g == 0 else self.io["ix_thr2"],
+                ix_lslots=self.io["ix_lslots"],
+                ix_list=self.io["ix_list"],
+                ix_sout=self.ix_merge[1 - g % 2],
+            )
+        return names
+
+    def _ix_ops(
+        self, s: Shape, ratio: int, layer: int, owner: int, head: dict, tail: dict, t
+    ) -> dict:
+        """The tiled index chain's launches of one index source layer: the plain arm (each group's score launches
+        and its merge), the candidate arm (with the group's block maxima, or its candidate mask, and the tail that
+        publishes the blocks), and the sparse reindex path's launches and selection."""
+        cfg = self.cfg
+        cs = cfg.candidate_source_layer
+        cand = "" if cs < 0 or layer < cs else "source" if layer == cs else "user"
+        # the bucketed G-tile chain: ceil(tiles/G) recipes, each ONE launch carrying the device-resident running
+        # top-512 (recipe k reads ix_rbuf[k%2], writes ix_rbuf[(k+1)%2]). The plain arm scans every tile; the
+        # candidate arm adds the source's per-tile block maxima ("bmax") or the consumer's candidate mask ("mask").
+        nrec, stride, _T = self.ix_chain_recipes(ratio), self.ix_rec_stride(s), s.T
+        tb = self.tables[s]
+
+        def chain_ops(kind: str) -> list:
+            out: list = []
+            for k in range(nrec):
+                names = {
+                    **head,
+                    "ix_vis": self.table + tb.off[f"ix_vis{ratio}"],
+                    "cmp_blocks": self.table + tb.off[f"cmp_blocks{ratio}"],
+                    "cmp_loff": self.loff[owner],
+                    "ix_rinit": self.ix_rbuf[k % 2],
+                    "ix_pinit": self.ix_pbuf[k % 2],
+                    "ix_rout": self.ix_rbuf[(k + 1) % 2],
+                    "ix_pout": self.ix_pbuf[(k + 1) % 2],
+                    "ix_list": self.io["ix_list"],
+                    "ix_lslots": self.io["ix_lslots"],
+                }
+                if kind == "bmax":
+                    # running top-INDEX_BLOCKS BLOCK list carried across recipes (ix_brbuf/ix_bpbuf); the last
+                    # tile lists cand_list/cand_slots/cand_thr directly — no full (kb, T) cand_bmax published.
+                    names.update(
+                        ix_visb=self.table + tb.off[self._visb(ratio)],
+                        cand_list=self.io["cand_list"],
+                        cand_slots=self.io["cand_slots"],
+                        cand_thr=self.io["cand_thr"],
+                        ix_brinit=self.ix_brbuf[k % 2],
+                        ix_bpinit=self.ix_bpbuf[k % 2],
+                        ix_brout=self.ix_brbuf[(k + 1) % 2],
+                        ix_bpout=self.ix_bpbuf[(k + 1) % 2],
+                    )
+                elif kind == "mask":
+                    names.update(
+                        cand_list=self.io["cand_list"],
+                        cand_slots=self.io["cand_slots"],
+                    )
+                for i in range(IX_CHAIN_G):
+                    tt = k * IX_CHAIN_G + i
+                    names[f"ix_gb{i}"] = self.table + tb.off[f"ix{ratio}.gb"] + 256 * tt
+                    names[f"ix_s{i}.p0"] = (
+                        self.table + tb.off[f"ix{ratio}.rec"] + 4 * 8 * stride * tt
+                    )
+                    if kind == "bmax":
+                        names[f"ix_gbb{i}"] = self.ix_bbase + 256 * tt
+                out.append(self._op(self.r["ixchain", s, kind, k > 0], layer, names))
+            return out
+
+        ops: dict = {"ixp": chain_ops("plain"), "ixc2": chain_ops("mask" if cand == "user" else "bmax")}
+        # the running block merge lists cand_list itself (last tile), so no separate ixbl selection tail.
+        ops["ixc_tail"] = []
+        if cand == "user" and self.ixc_launches(s):
+            # query-block batches: each scores only its own columns into the bounded (kc, sparse_batch) staging,
+            # then selects; the column slices keep every bound section 256-byte aligned (sparse_batch a mult of 64)
+            sb, per = self.sparse_batch(s), self.ixc_launches(s)
+            ct = self.cfg.candidate_topk_blocks
+            ops["ixsp"] = []
+            for b in range(self.ixsc_batches(s)):
+                co = b * sb
+                q8o, wo = L.INDEX_DIM * L.INDEX_HEADS * co, 4 * L.INDEX_HEADS * co
+                for j in range(per):
+                    ops["ixsp"].append(
+                        self._op(
+                            self.r["ixc", s],
+                            layer,
+                            {
+                                **head,
+                                "ix_slots": t("ixsc.rec") + 4 * 8 * s.ix_slots * (b * per + j),
+                                "ix_score": self.io["ix_score_sparse"],
+                                "ix_cpos": self.io["ix_cpos"],
+                                "cmp_loff": self.loff[owner],
+                                "cmp_blocks": t(f"cmp_blocks{ratio}") + 4 * self.pages * co,
+                                "ix_q8": self.io["ix_q8"] + q8o,
+                                "ix_qs": self.io["ix_qs"] + wo,
+                                "ix_w": self.io["ix_w"] + wo,
+                                "cand_list": self.io["cand_list"] + 4 * ct * co,
+                                "cand_slots": self.io["cand_slots"] + 4 * 8 * co,
+                            },
+                        )
+                    )
+                ops["ixsp"].append(
+                    self._op(
+                        self.r["sel", s, "user", "sparse"],
+                        layer,
+                        {
+                            "ix_score": self.io["ix_score_sparse"],
+                            "ix_cpos": self.io["ix_cpos"],
+                            "ix_vis": t(f"ix_vis{ratio}") + 4 * co,
+                            "ix_visc": t("ix_visc") + 4 * co,
+                            "ix_list": self.io["ix_list"] + 4 * L.INDEX_RUN * co,
+                            "ix_lslots": self.io["ix_lslots"] + 4 * 8 * co,
+                        },
+                    )
+                )
+            ops["ixsp_tail"] = []
+        return ops
+
+    def _attn_tile_ops(self, s: Shape, layer: int, common: dict, tail: dict, t) -> list:
+        """The bounded attention stream's per-query-tile launches: T/Q tiles, each binding tile_off + its
+        q_all / cs_inv / o_out column slice (mirrors ixsc_batches). The listed gather reads the FULL ix_list /
+        ix_lslots / cmp_blocks at column tile_off+q; the window gather reads the global positional win_pages
+        table + the per-column wslots klen + meta (pos0). The tiles write o_out's columns, then out_wo projects
+        the full T output."""
+        d, T = self.d, s.T
+        D, nh = d.head_dim, d.heads
+        Q = min(L.ATTN_TILE_Q, T)
+        cs = "cs1" if self._ratio(layer) else "cs0"
+        ops = []
+        for tile in range(T // Q):
+            co = tile * Q
+            ops.append(
+                self._op(
+                    self.r["out_tile", s],
+                    layer,
+                    {
+                        **common,
+                        **tail,
+                        "q_all": self.io["q_all"] + 2 * D * nh * co,
+                        "ix_list": self.io["ix_list"],
+                        "ix_lslots": self.io["ix_lslots"],
+                        "tile_off": self.attn_tile_off[s] + 256 * tile,
+                        "cs_inv": t(cs + "_inv") + 4 * 128 * co,
+                        "o_tile": self.io["o_out"] + 4 * D * nh * co,
+                        "win_pages": t(f"win_pos.{layer}"),
+                        "wslots": t("wslots"),
+                    },
+                )
+            )
+        return ops
 
     # ------------------------------------------------------------------ weights
     def _load(self, barrier) -> dict[str, int]:
@@ -676,6 +1033,90 @@ class DeepSeekV41Gaudi:
             dev.h2d(table + 256 * first, data)
             dev.h2d(scales + 4 * first, rs)
 
+    # ------------------------------------------------------------------ host-Engram tables
+    def _load_host_tables(self) -> None:
+        """Host-Engram: hold the lookup tables in host RAM as a file-backed MAP_SHARED mmap of the
+        checkpoint shards (one physical copy shared by the ranks through the page cache), in FILE
+        format (256 OCP E4M3 codes + 8 E8M0 scale bytes per row). Prewarm them resident, check
+        residency with mincore and log it (report if low — never silently fall back), reject e8m0
+        0xFF scales at load, and keep numpy views of each layer's weight (rows,256) u8 and scale
+        (rows,8) u8. The Rust fill gathers and dequantizes these per step; nothing is uploaded here."""
+        import ctypes
+        import json
+        import mmap
+        import os
+        import struct
+
+        from resin_models_gaudi.deepseek_v41.weights import (
+            _reject_nan_engram_scales,
+            reader,
+        )
+
+        src = reader(self.checkpoint)
+        shards = {
+            layer: src.weight_map[f"layers.{layer}.engram.embed.weight"]
+            for layer in self.engram_layers
+        }
+        # prewarm each distinct shard once (a sequential read pulls it into the page cache)
+        if self.engram_prewarm:
+            for shard in sorted(set(shards.values())):
+                self._prewarm_shard(self.checkpoint / shard)
+        page = os.sysconf("SC_PAGE_SIZE")
+        libc = ctypes.CDLL(None, use_errno=True)
+        for layer, shard in shards.items():
+            path = self.checkpoint / shard
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                header_bytes = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+                header = json.loads(os.pread(fd, header_bytes, 8))
+                base = 8 + header_bytes
+                name = f"layers.{layer}.engram.embed"
+                # Python's mmap defaults to MAP_SHARED: the ranks share one physical copy
+                mapping = mmap.mmap(fd, path.stat().st_size, prot=mmap.PROT_READ)
+            finally:
+                os.close(fd)
+            raw = np.frombuffer(mapping, np.uint8)
+            woff = base + header[f"{name}.weight"]["data_offsets"][0]
+            soff = base + header[f"{name}.scale"]["data_offsets"][0]
+            rows = header[f"{name}.weight"]["shape"][0]
+            weight = raw[woff : woff + rows * 256].reshape(rows, 256)
+            scale = raw[soff : soff + rows * 8].reshape(rows, 8)
+            _reject_nan_engram_scales(scale)
+            # mincore over the whole mapping (raw starts at the page-aligned mmap base)
+            pages = (raw.nbytes + page - 1) // page
+            vec = (ctypes.c_ubyte * pages)()
+            if libc.mincore(ctypes.c_void_p(raw.ctypes.data), ctypes.c_size_t(raw.nbytes), vec) != 0:
+                raise OSError(ctypes.get_errno(), f"mincore {shard}")
+            resident = sum(1 for v in vec if v & 1) / pages
+            self.log(
+                f"ds41 host-Engram layer {layer}: {rows} rows from {shard}, {resident:.1%} resident"
+            )
+            if resident < 0.95:
+                self.log(
+                    f"WARNING: host-Engram layer {layer} ({shard}) is only {resident:.1%} resident "
+                    "after prewarm; the per-step gather will fault pages (no fallback is taken)"
+                )
+            self.eg_host[layer] = (weight, scale)
+            # hold the mapping and its views alive for the model's lifetime (the views export buffers)
+            self._eg_host_maps.append((mapping, raw, weight, scale))
+
+    @staticmethod
+    def _prewarm_shard(path) -> None:
+        """Read a shard once, sequentially, into the page cache so the mmap gather is RAM-resident."""
+        import os
+
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            view = memoryview(bytearray(1 << 30))
+            offset, size = 0, path.stat().st_size
+            while offset < size:
+                read = os.preadv(fd, [view], offset)
+                if read <= 0:
+                    break
+                offset += read
+        finally:
+            os.close(fd)
+
     # ------------------------------------------------------------------ buffers and graphs
     def _buffers(self) -> None:
         d, dev, T = self.d, self.device, TMAX
@@ -703,6 +1144,17 @@ class DeepSeekV41Gaudi:
         self.c_identity = {
             t: const(identity(t)) for t in (*DECODE_BUCKETS, *PREFILL_BUCKETS)
         }
+        # the bounded attention stream's per-tile step-column offset (tile*Q), each tile in its own 256-byte
+        # (64 i32) slot so the tile_off section base is 256-aligned for every tile (sections validate at 256)
+        self.attn_tile_off = {}
+        for s in self.shapes:
+            if s.prefill:
+                Q = min(L.ATTN_TILE_Q, s.T)
+                nt = s.T // Q
+                a = np.zeros((nt, 64), np.int32)
+                for tile in range(nt):
+                    a[tile, 0] = tile * Q
+                self.attn_tile_off[s] = const(a)
         self.loff = {
             o: const(np.array([self.geo.owner_offset(o), -1] + [0] * 62, np.int32))
             for o in self.geo.owners
@@ -716,35 +1168,103 @@ class DeepSeekV41Gaudi:
         W = nh * T
         self.io = {
             "q_all": buf(2 * D * W),
+            "o_out": buf(4 * D * W),
+            "win_stored": buf(256),  # window store marker (persistent output keeps the store alive when the
+            # bounded stream skips the pre-graph's window attention; else Synapse DCE removes the store)
             "o1": buf(4 * D * W),
             "m1": buf(4 * W),
             "l1": buf(4 * W),
             "ix_q8": buf(L.INDEX_DIM * L.INDEX_HEADS * T),
             "ix_qs": buf(4 * L.INDEX_HEADS * T),
             "ix_w": buf(4 * L.INDEX_HEADS * T),
-            "ix_score": buf(4 * self.kmax * T),
+            "ix_thr2": buf(4 * 64 * T),
             "ix_list": buf(4 * L.INDEX_TOP * T),
             "ix_lslots": buf(4 * 8 * T),
-            "cand_bmax": buf(4 * self.kb * T),
+            # the sparse arm's compact scores and positions, bounded to ONE query-block batch (kc, SPARSE_BATCH):
+            # each batch scores only its own columns, so the staging never grows with the step's T (the OOM fix)
+            "ix_score_sparse": buf(4 * max(1, self.kc) * SPARSE_BATCH),
             "cand_thr": buf(4 * 64 * T),
             "cand_list": buf(4 * max(1, self.cfg.candidate_topk_blocks) * T),
             "cand_slots": buf(4 * 8 * T),
-            "ix_cpos": buf(4 * max(1, self.kc) * T),
+            "ix_cpos": buf(4 * max(1, self.kc) * SPARSE_BATCH),
             "cmp_sink": buf(256),
             "cmp_stored": buf(256),
             "ix_sink": buf(256 * 8),  # (a part's sink each, prefill index launches)
             "ix_thr": buf(4 * 64 * T),
-            "eg_emb": buf(4 * 256 * J * T),
             # decode: each rank's rows of the Engram wkv product, and all of them gathered
             "eg_kv": buf(4 * self.eg_rows_r * MAX_T),
             "eg_kv_all": buf(4 * self.eg_rows_r * MAX_T * d.ranks),
         }
+        # eg_emb is the card-engram embedding scratch; host-engram keeps embeddings in the step table, so the
+        # (256*J, T) f32 buffer is unused there — drop it (design §3.2).
+        if self.engram == "card":
+            self.io["eg_emb"] = buf(4 * 256 * J * T)
         if self.stages:  # DSpark: the target layers' stream means, the draft tokens, the inject stores' sinks
             for k in range(len(self.cfg.dspark_target_layer_ids)):
                 self.io[f"dsp_main{k}"] = buf(4 * H * TMAX)
             self.io["dsp_out"] = buf(4 * self.block * MAX_T)
             for k in range(self.stages):
                 self.io[f"dsp_sink{k}"] = buf(256)
+        # the tiled indexer: a merge group's running candidates and its own keys, alternating between the group
+        # that reads and the group that writes, and the running candidates' positions
+        pairs = max((L.INDEX_RUN + self.ix_rows(s)) * s.T for s in self.shapes)
+        self.ix_merge = [buf(4 * pairs), buf(4 * pairs)]
+        self.ix_pos = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
+        # the bucketed chain's device-resident running top-512 carried ACROSS G-tile recipes: recipe k reads
+        # ix_rbuf[k%2]/ix_pbuf[k%2] (the previous recipe's ix_rout/ix_pout) and writes ix_rbuf[(k+1)%2]. Constant
+        # in the context (run rows, not kmax) — the hierarchical merge's running set never leaves the device.
+        self.ix_rbuf = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
+        self.ix_pbuf = [buf(4 * L.INDEX_RUN * T) for _ in range(2)]
+        # the candidate source's running top-INDEX_BLOCKS BLOCK list, carried across G-tile recipes exactly like
+        # ix_rbuf/ix_pbuf (recipe k reads [k%2], writes [(k+1)%2]). Bounded (INDEX_BLOCKS, T), not (kb, TMAX): the
+        # full block-maxima array is never published. ix_bbase[tt] = tt*BLOCK_TILE (the tile's first block index).
+        self.ix_brbuf = [buf(4 * L.INDEX_BLOCKS * T) for _ in range(2)]
+        self.ix_bpbuf = [buf(4 * L.INDEX_BLOCKS * T) for _ in range(2)]
+        _ntiles = max(self.ix_chain_recipes(r) * IX_CHAIN_G for r in (1, 2))
+        _bb = np.zeros((_ntiles, 64), np.int32)
+        for _tt in range(_ntiles):
+            _bb[_tt, 0] = _tt * L.BLOCK_TILE
+        self.ix_bbase = const(_bb)
+        self.ix_tile = buf(4 * max(self.ix_rows(s) * s.T for s in self.shapes))
+        self.ixcap = {}
+        if _os.environ.get("RESIN_DS41_IXCAP"):
+            _rows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+            for _l in self.cfg.index_source_layers:
+                self.ixcap[_l] = buf(4 * _rows * MAX_T)
+            self.ixcap_list = buf(4 * L.INDEX_TOP * TMAX)
+            self.ixcap_tile = buf(4 * max(self.ix_rows(s) * s.T for s in self.shapes if s.prefill))
+            _mg = max(self.ix_groups(s, r) for s in self.shapes if s.prefill for r in (1, 2))
+            self.ixcap_pos = buf(4 * _mg * L.INDEX_RUN)
+            self.ixcap_score = buf(4 * _mg * L.INDEX_RUN)
+            self.ixcap_groups = _mg
+            # per-layer DECODE selection (ix_list col0) and score tile, captured after each layer's index ops
+            self.ixcap_dl = {_l: buf(4 * L.INDEX_TOP * MAX_T) for _l in self.cfg.index_source_layers}
+            self.ixcap_dt = {_l: buf(4 * _rows * MAX_T) for _l in self.cfg.index_source_layers}
+            # COMPREHENSIVE per-layer capture: decode step0 col0 (d) and prefill last-real-col reg7 (p)
+            _prows = max(self.ix_rows(s) for s in self.shapes if s.prefill)
+            _H4 = 4 * self.d.hidden
+            self.cap = {}
+            for _l in self.cfg.index_source_layers:
+                self.cap[_l] = {
+                    "d_q8": buf(L.INDEX_DIM * L.INDEX_HEADS), "d_qs": buf(4 * L.INDEX_HEADS),
+                    "d_w": buf(4 * L.INDEX_HEADS), "d_list": buf(4 * L.INDEX_TOP),
+                    "d_lslots": buf(4 * 8), "d_tile": buf(4 * _rows), "d_x": buf(_H4 * 4),
+                    "p_q8": buf(L.INDEX_DIM * L.INDEX_HEADS), "p_qs": buf(4 * L.INDEX_HEADS),
+                    "p_w": buf(4 * L.INDEX_HEADS), "p_list": buf(4 * L.INDEX_TOP),
+                    "p_lslots": buf(4 * 8), "p_tile": buf(4 * _prows), "p_x": buf(_H4 * 4),
+                }
+        # RESIN_DS41_PFLIST: capture every index source layer's full prefill top-512 list (512, T) after its
+        # index ops, for the differential fidelity gate against the checkpoint reference (default off)
+        self.pf_list = {}
+        self.pf_lslots = {}
+        self.pf_meta = None
+        if _os.environ.get("RESIN_DS41_PFLIST"):
+            for _l in self.cfg.index_source_layers:
+                if _l < self.n_layers:
+                    self.pf_list[_l] = buf(4 * L.INDEX_TOP * TMAX)
+                    self.pf_lslots[_l] = buf(4 * 8 * TMAX)
+            self.pf_meta = buf(8)  # the last prefill chunk's (pos0, n) from meta
+            self.pf_cand = buf(4 * max(1, self.cfg.candidate_topk_blocks) * TMAX)  # L20's candidate block list
         self.logits = buf(4 * d.vocab * TMAX)
         self.logits_all = (
             buf(4 * d.vocab * TMAX * self.nranks) if self.nranks > 1 else self.logits
@@ -821,45 +1341,71 @@ class DeepSeekV41Gaudi:
                     if self.dense(s):
                         graphs[key + ("dense",)] = L.attention_graph(
                             dev, d, T, s.win_slots, s.win_keys, nb, self.pages, ratio=ratio, residual=residual,
-                            query_block=qb, capture=capture, dense=DENSE_KEYS, scores=self.kmax,
+                            query_block=qb, capture=capture, dense=DENSE_KEYS, scores=self.ix_rows(s),
                         )  # fmt: skip
                 else:
+                    # window_attn=False for EVERY shape: prefill's bounded stream and decode's fused listed
+                    # path both gather their own window blocks from the arena, so the pre-graph window
+                    # attention part (o1/m1/l1) is dead work (decode used to compute it twice); win_stored,
+                    # a persistent output, keeps the window STORE alive without a consumer.
                     graphs[key] = L.attention_pre_graph(
                         dev, d, T, s.win_slots, s.win_keys, nb, ratio=ratio, owner=owner, source=source,
                         groups=s.groups2 if ratio > 1 else T, state_rows=R, residual=residual, query_block=qb,
-                        capture=capture,
+                        capture=capture, window_attn=False,
                     )  # fmt: skip
-            if any(cfg.compress_ratios[i] for i in range(self.n_layers)):
+            if not WINDOW_ONLY and any(cfg.compress_ratios[i] for i in range(self.n_layers)):
+                rows, top = self.ix_rows(s), cfg.candidate_topk_blocks
                 graphs["ix", s] = L.index_score_graph(
-                    dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kmax, query_block=qb,
-                    parts=PREFILL_IX_PARTS if s.prefill else 1,
+                    dev, d, T, s.ix_slots, INDEX_KEYS, nb, rows, query_block=qb,
+                    parts=self.ix_parts(s), cpages=self.pages,
                 )  # fmt: skip
-                cands = (
-                    ("", "source", "user") if cfg.candidate_source_layer >= 0 else ("",)
-                )
-                top = cfg.candidate_topk_blocks
-                for cand in cands:
-                    for radix in (False,) if s.prefill else (False, True):
-                        graphs["sel", s, cand, radix] = L.index_select_graph(
-                            dev, d, T, self.kmax, cand, top, radix,
-                            sparse=cand == "source" and not s.prefill, cand_blocks=self.kb,
+                for r in (1, 2):
+                    graphs["ixg", s, r] = L.index_gslot_graph(
+                        dev, d, T, self.ix_rec_stride(s), 1, 1,
+                        s.blocks, s.qb, r, self.ix_tiles_padded(r), INDEX_KEYS,
+                        L.INDEX_RUN, PAGE_TOKENS,
+                    )  # fmt: skip
+                # the bucketed G-tile index chain (plain / candidate-bmax / consumer-mask): each recipe unrolls
+                # IX_CHAIN_G tiles into ONE launch carrying the running top-512 device-resident; recipe 0 starts
+                # fresh (carry=False), later recipes fold the incoming running set (carry=True). One slot per
+                # query block (s.blocks); the record stride is ix_rec_stride for 256-aligned section bases.
+                for kind in ("plain", "bmax", "mask"):
+                    for carry in (False, True):
+                        graphs["ixchain", s, kind, carry] = L.index_chain_graph(
+                            dev, d, T, s.blocks, INDEX_KEYS, nb, L.INDEX_RUN, IX_CHAIN_G,
+                            query_block=qb, parts=1, cpages=self.pages, carry=carry, kind=kind,
                         )  # fmt: skip
-                    if s.prefill and PREFILTER_BLOCKS:
-                        graphs["sel", s, cand, "pf"] = L.index_select_graph(
-                            dev, d, T, self.kmax, cand, top, cand_blocks=self.kb, prefilter=PREFILTER_BLOCKS
-                        )  # fmt: skip
+                # (the old index_merge / index_blocks / index_mask / index_block_select graphs were dead — built
+                # and compiled but never launched; the bucketed chain above publishes the candidate blocks and
+                # the sparse arm selects from them, so they are removed to drop ~5x12 dead compiled recipes.)
                 if self.ixc_launches(s):
+                    # the sparse arm scores one column's candidate entries per slot (query_block=1) over ONE
+                    # query-block batch of sparse_batch columns; the step runs ixsc_batches batches, each binding
+                    # its column slice, so the compact staging stays (kc, sparse_batch) — the OOM fix
+                    sb = self.sparse_batch(s)
                     graphs["ixc", s] = L.index_score_graph(
-                        dev, d, T, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=qb,
+                        dev, d, sb, s.ix_slots, INDEX_KEYS, nb, self.kc, query_block=1,
                         cand_top=top, pages=self.pages,
                     )  # fmt: skip
                     graphs["sel", s, "user", "sparse"] = L.index_select_graph(
-                        dev, d, T, self.kc, "user", top, sparse=True
+                        dev, d, sb, self.kc, "user", top, sparse=True
                     )
-                graphs["out", s] = L.attention_out_graph(dev, d, T, nb, self.pages)
+                if s.prefill:
+                    # the bounded online attention stream: one query-tile recipe (10 key-blocks unrolled,
+                    # loop-carried acc_o/max/sum) launched T/Q times per layer, then one wo_a/wo_b recipe
+                    graphs["out_tile", s] = L.attention_out_tile_graph(
+                        dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys,
+                        win_pages=self.pages,
+                    )  # fmt: skip
+                    graphs["out_wo", s] = L.attention_out_wo_graph(dev, d, T)
+                else:
+                    graphs["out", s] = L.attention_out_graph(
+                        dev, d, T, nb, self.pages, win_slots=s.win_slots, win_keys=s.win_keys
+                    )
                 if self.dense(s):
                     graphs["out", s, "dense"] = L.attention_out_graph(
-                        dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=self.kmax
+                        dev, d, T, nb, self.pages, dense=DENSE_KEYS, scores=self.ix_rows(s),
+                        win_slots=s.win_slots, win_keys=s.win_keys,
                     )
             for layer in self.engram_layers:
                 if self.eg_sharded(s):
@@ -881,9 +1427,13 @@ class DeepSeekV41Gaudi:
                 graphs["sample", s, R_] = sample_graph(dev, d, T, R_, self.nranks)  # type: ignore[arg-type]
         return graphs
 
+    def _ratio(self, layer: int) -> int:
+        """A layer's compress ratio; 0 for every layer under the window-only diagnostic."""
+        return 0 if WINDOW_ONLY else self.cfg.compress_ratios[layer]
+
     def _attention_key(self, layer: int, s: Shape) -> tuple:
         cfg = self.cfg
-        ratio = cfg.compress_ratios[layer]
+        ratio = self._ratio(layer)
         residual = layer not in self.engram_layers
         capture = (
             bool(self.stages) and layer in cfg.dspark_target_layer_ids
@@ -893,16 +1443,23 @@ class DeepSeekV41Gaudi:
         owner = layer in cfg.kv_source_layers
         source = layer in cfg.index_source_layers
         if (
-            not owner and not source
-        ):  # one launch: no index launches between its two parts
+            not owner and not source and not s.prefill
+        ):  # decode: one launch (no index launches between its two parts); prefill streams the out part
             return ("attn", s, ratio, owner, source, residual, capture)
         return ("pre", s, ratio, owner, source, residual, capture)
 
     def _compile(self) -> None:
         progress.building_graphs()
         graphs = self._graphs()
-        recipes = self.recipes.compile_many(list(graphs.values()))
+        # Each compile thread gets its own device context, and a context grows to its recipe's workspace — the
+        # largest here is 6.6 GiB (ds41_ffn_paged_T128, 0x1881d0c00) — so two at once already exceed a card's
+        # free memory on a cold recipe cache (synDeviceMalloc ... status=26). One at a time fits; the disk cache
+        # makes this a first-boot cost only.
+        recipes = self.recipes.compile_many(list(graphs.values()), workers=1)
         self.r: dict[tuple, Recipe] = dict(zip(graphs.keys(), recipes, strict=True))
+        if __import__("os").environ.get("RESIN_STEP_PROF"):
+            for _i, _k in enumerate(graphs.keys()):
+                print(f"PROFNAME\t{_i}\t{_k}", flush=True)
         for g in graphs.values():
             g.destroy()
         self.compiles_at_start = self.device.compile_count
@@ -928,8 +1485,375 @@ class DeepSeekV41Gaudi:
     def compiles_after_start(self) -> int:
         return self.device.compile_count - self.compiles_at_start
 
+    # ------------------------------------------------------------------ diagnostics
+    def dump_full(self, tag: str = "full") -> None:
+        """Comprehensive offline-debug dump: per-layer decode-step0 (d_) and prefill-last-real-col (p_)
+        q8/qs/w/list/lslots/tile/residual, the candidate arm, arena index pages + page tables + loff,
+        with a manifest. Each tensor saved independently so one failure cannot drop the rest."""
+        import json as _json
+        import os as _os
+
+        import numpy as _np
+        dev = self.device
+        D = "/tmp/index-merge-fix"
+        K = "/tmp/kv-quant-fix/cap"
+        _os.makedirs(D, exist_ok=True)
+        _os.makedirs(K, exist_ok=True)
+        man = {"tag": tag, "rank": self.rank, "tensors": [], "errors": []}
+        def save(path, arr):
+            _np.save(path, arr)
+            man["tensors"].append(_os.path.basename(path))
+        H4 = 4 * self.d.hidden
+        _drows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+        _prows = max(self.ix_rows(s) for s in self.shapes if s.prefill)
+        specs = [("q8", (L.INDEX_DIM * L.INDEX_HEADS,), _np.uint8), ("qs", (L.INDEX_HEADS,), _np.float32),
+                 ("w", (L.INDEX_HEADS,), _np.float32), ("list", (L.INDEX_TOP,), _np.int32),
+                 ("lslots", (8,), _np.int32), ("x", (H4,), _np.float32)]
+        for layer, cp in getattr(self, "cap", {}).items():
+            for pre, shp, dt in specs:
+                for ph in ("d", "p"):
+                    try:
+                        save(f"{D}/cap_{ph}_{pre}_L{layer}_{tag}_r{self.rank}.npy", dev.d2h(cp[f"{ph}_{pre}"], shp, dt))
+                    except Exception as e:
+                        man["errors"].append(f"{ph}_{pre}_L{layer}: {e}")
+            for ph, rows in (("d", _drows), ("p", _prows)):
+                try:
+                    save(f"{D}/cap_{ph}_tile_L{layer}_{tag}_r{self.rank}.npy", dev.d2h(cp[f"{ph}_tile"], (rows,), _np.float32))
+                except Exception as e:
+                    man["errors"].append(f"{ph}_tile_L{layer}: {e}")
+        for nm, n, dt in [("cand_bmax", self.kb, _np.float32), ("cand_thr", 64, _np.int32),
+                          ("cand_list", max(1, self.cfg.candidate_topk_blocks), _np.int32)]:
+            try:
+                save(f"{D}/{nm}_{tag}_r{self.rank}.npy", dev.d2h(self.io[nm], (n,), dt))
+            except Exception as e:
+                man["errors"].append(f"{nm}: {e}")
+        # arena index pages around the needle + page tables + owner offsets
+        try:
+            npos = int(_os.environ.get("RESIN_DS41_NEEDLE_POS", "16214"))
+            if _os.path.exists("/tmp/other-stingray/needle_pos"):
+                npos = int(open("/tmp/other-stingray/needle_pos").read().strip())
+            cb1 = dev.d2h(self.table + self.tables[Shape(1, False)].off["cmp_blocks1"], (self.pages,), _np.int32)
+            blk = int(cb1[npos // PAGE_TOKENS]) // 1024
+            c0, c1 = max(0, blk - 5), min(self.arena_blocks, blk + 15)
+            save(f"{K}/arena2_{tag}_r{self.rank}.npy", dev.d2h(self.arena + c0 * 1024 * 512, ((c1 - c0) * 1024 * 512,), _np.uint8))
+            save(f"{K}/arenab02_{tag}_r{self.rank}.npy", _np.array(c0, _np.int64))
+        except Exception as e:
+            man["errors"].append(f"arena2: {e}")
+        for r in (1, 2):
+            for Tk, tb in self.tables.items():
+                if f"cmp_blocks{r}" not in tb.off:
+                    continue
+                try:
+                    cb = dev.d2h(self.table + tb.off[f"cmp_blocks{r}"], (Tk.T * self.pages,), _np.int32).reshape(Tk.T, -1)
+                    save(f"{K}/cmpblocks{r}_T{Tk.T}_{tag}_r{self.rank}.npy", cb)
+                except Exception as e:
+                    man["errors"].append(f"cmpblocks{r}_T{Tk.T}: {e}")
+        for o in self.geo.owners:
+            try:
+                save(f"{K}/loff{o}_{tag}_r{self.rank}.npy", dev.d2h(self.loff[o], (64,), _np.int32))
+            except Exception as e:
+                man["errors"].append(f"loff{o}: {e}")
+        # WINDOW host tables: slots (key0/klen) + per-layer window latent pages (lat.{layer})
+        for Tk, tb in self.tables.items():
+            if "slots" not in tb.off:
+                continue
+            try:
+                save(f"{K}/wslots_T{Tk.T}_{tag}_r{self.rank}.npy", dev.d2h(self.table + tb.off["slots"], (Tk.win_slots * 8,), _np.int32).reshape(Tk.win_slots, 8))
+            except Exception as e:
+                man["errors"].append(f"wslots_T{Tk.T}: {e}")
+            for layer in range(self.n_layers):
+                if f"lat.{layer}" not in tb.off:
+                    continue
+                try:
+                    save(f"{K}/wlat_L{layer}_T{Tk.T}_{tag}_r{self.rank}.npy", dev.d2h(self.table + tb.off[f"lat.{layer}"], (Tk.win_slots * (Tk.win_keys // PAGE_TOKENS),), _np.int32).reshape(Tk.win_slots, -1))
+                except Exception as e:
+                    man["errors"].append(f"wlat_L{layer}_T{Tk.T}: {e}")
+        # WINDOW arena KV: the physical rows the decode (T=1) window lat.0 points at (recent tokens near pt,
+        # NOT the needle region). Capture [min_row .. max_row+PAGE_ROWS) so the harness can gather window keys.
+        try:
+            Tkd = Shape(1, False)
+            tbd = self.tables[Tkd]
+            if "lat.0" in tbd.off:
+                npg = Tkd.win_keys // PAGE_TOKENS
+                lat0 = dev.d2h(self.table + tbd.off["lat.0"], (Tkd.win_slots * npg,), _np.int32)
+                rows = lat0[lat0 >= 0]
+                amax = self.arena_blocks * 1024
+                if rows.size and int(rows.min()) >= 0 and int(rows.max()) + PAGE_ROWS <= amax:
+                    r0 = int(rows.min())
+                    r1 = int(rows.max()) + PAGE_ROWS
+                    save(f"{K}/warena_{tag}_r{self.rank}.npy", dev.d2h(self.arena + r0 * 512, ((r1 - r0) * 512,), _np.uint8))
+                    save(f"{K}/warena_b0_{tag}_r{self.rank}.npy", _np.array(r0, _np.int64))
+                else:
+                    man["errors"].append(f"warena: lat0 out of arena range (min={int(rows.min()) if rows.size else -1} max={int(rows.max()) if rows.size else -1} amax={amax})")
+        except Exception as e:
+            man["errors"].append(f"warena: {e}")
+        _json.dump(man, open(f"{D}/manifest_{tag}_r{self.rank}.json", "w"), indent=0)
+        print(f"[dump_full {tag}] {len(man['tensors'])} tensors, {len(man['errors'])} errors", flush=True)
+
+    def dump_step(self, tag: str = "") -> None:
+        """RESIN_DS41_DUMP: after a step, print what the residual stream and the head actually hold.
+
+        The end-to-end symptom is one token repeated, which is what a hidden state dominated by the current
+        token's embedding looks like.  These numbers separate that from a broken head/sampler without any
+        reference: the two residual buffers' magnitudes, whether they are distinct (i.e. the layers are
+        adding something), each column's cosine against the embedding rows, and the logits' shape.
+        """
+        d, dev = self.d, self.device
+        H, nh = d.hidden, d.heads
+        n = 4 * H * 4  # one column of a (4H, T) residual: 4 streams, f32
+        out = {}
+        # per-layer partials/residual of the last step (localize the first diverging layer)
+        import os as _os
+        _df = None
+        if _os.environ.get("RESIN_DS41_DUMP_FILE"):
+            _df = open(_os.environ["RESIN_DS41_DUMP_FILE"], "a")
+        for s, prog in self._programs.items():
+            if s.prefill and getattr(prog, "layers", None):
+                print(f"[dump {tag}] per-layer column 0 (T={s.T}):")
+                for i, ops in enumerate(prog.layers):
+                    pa = dev.d2h(ops["p_attn"], (H,), np.float32)
+                    pf = dev.d2h(ops["p_ffn"], (H,), np.float32)
+                    xf = dev.d2h(ops["x_ffn"], (4 * H,), np.float32)
+                    line = (f"[dump {tag}]   L{i}: |p_attn| {np.linalg.norm(pa):.4f} "
+                            f"|p_ffn| {np.linalg.norm(pf):.4f} |x_ffn| {np.linalg.norm(xf):.4f} "
+                            f"finite {np.isfinite(xf).all()}")
+                    print(line)
+                    if _df:
+                        _df.write(line + "\n")
+                break
+        if "ix_list" in self.io:
+            _os.makedirs("/tmp/moe-oracle", exist_ok=True)
+            T2 = 2048
+            il = dev.d2h(self.io["ix_list"], (512 * T2,), np.int32).reshape(T2, 512)
+            np.save(f"/tmp/moe-oracle/ixlist_{tag}_r{self.rank}.npy", il)
+            ils = dev.d2h(self.io["ix_lslots"], (8 * T2,), np.int32).reshape(T2, 8)
+            np.save(f"/tmp/moe-oracle/ixls_{tag}_r{self.rank}.npy", ils)
+            print(f"[dump {tag}] ix_list col1746 first16 {il[1746,:16].tolist()} lslots {ils[1746].tolist()}", flush=True)
+            if hasattr(self, "_trace_ixvis"):
+                for r in (1, 2):
+                    iv = dev.d2h(self._trace_ixvis[r - 1], (2048,), np.int32)
+                    np.save(f"/tmp/moe-oracle/ixvis{r}_{tag}_r{self.rank}.npy", iv)
+                    print(f"[dump {tag}] PREFILL ix_vis{r} c500/1000/1535/1536/1746/2047 = "
+                          f"{[int(iv[c]) for c in (500,1000,1535,1536,1746,2047)]}", flush=True)
+        if _os.environ.get("RESIN_DS41_IXCAP"):
+          try:
+            import numpy as _np
+            _td2 = "/tmp/index-merge-fix"
+            _os.makedirs(_td2, exist_ok=True)
+            _rows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+            for _l, _cap in self.ixcap.items():
+                _a = dev.d2h(_cap, (_rows * MAX_T,), np.float32).reshape(MAX_T, _rows)
+                _np.save(f"{_td2}/ixcap_L{_l}_{tag}_r{self.rank}.npy", _a[0])
+            for _l, _cap in getattr(self, "ixcap_dl", {}).items():
+                _np.save(f"{_td2}/ixdl_L{_l}_{tag}_r{self.rank}.npy", dev.d2h(_cap, (L.INDEX_TOP * MAX_T,), np.int32).reshape(MAX_T, L.INDEX_TOP)[0])
+                _np.save(f"{_td2}/ixdt_L{_l}_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_dt[_l], (_rows * MAX_T,), np.float32).reshape(MAX_T, _rows)[0])
+            for _nm in ("cand_bmax", "cand_thr", "cand_list", "ix_thr", "ix_thr2"):
+                if _nm in self.io:
+                    _n = {"cand_bmax": self.kb, "cand_thr": 64, "cand_list": max(1, self.cfg.candidate_topk_blocks), "ix_thr": 64, "ix_thr2": 64}[_nm]
+                    _dt = np.int32 if _nm in ("cand_thr", "cand_list", "ix_thr", "ix_thr2") else np.float32
+                    _np.save(f"{_td2}/{_nm}_{tag}_r{self.rank}.npy", dev.d2h(self.io[_nm], (_n * MAX_T,), _dt).reshape(MAX_T, _n)[0])
+            _kc = max(1, self.kc)
+            _np.save(f"{_td2}/ix_score_sparse_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_score_sparse"], (_kc * SPARSE_BATCH,), np.float32).reshape(SPARSE_BATCH, _kc)[0])
+            _np.save(f"{_td2}/ix_cpos_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_cpos"], (_kc * SPARSE_BATCH,), np.int32).reshape(SPARSE_BATCH, _kc)[0])
+            _np.save(f"{_td2}/ixlist2_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_list"], (L.INDEX_TOP * MAX_T,), np.int32).reshape(MAX_T, L.INDEX_TOP)[0])
+            _np.save(f"{_td2}/ixlistfull_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_list"], (L.INDEX_TOP * TMAX,), np.int32).reshape(TMAX, L.INDEX_TOP))
+            _np.save(f"{_td2}/ixvisb_{tag}_r{self.rank}.npy", dev.d2h(self.table + self.tables[Shape(1, False)].off["ix_visb"], (MAX_T,), np.int32))
+            if hasattr(self, "ixcap_list"):
+                _np.save(f"{_td2}/ixlistpf_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_list, (L.INDEX_TOP * TMAX,), np.int32).reshape(TMAX, L.INDEX_TOP))
+                _prows = max(self.ix_rows(s) * s.T for s in self.shapes if s.prefill)
+                _np.save(f"{_td2}/ixtilepf_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_tile, (_prows,), np.float32))
+                if hasattr(self, "ixcap_pos"):
+                    _np.save(f"{_td2}/ixcappos_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_pos, (self.ixcap_groups * L.INDEX_RUN,), np.int32).reshape(self.ixcap_groups, L.INDEX_RUN))
+                    _np.save(f"{_td2}/ixcapscore_{tag}_r{self.rank}.npy", dev.d2h(self.ixcap_score, (self.ixcap_groups * L.INDEX_RUN,), np.float32).reshape(self.ixcap_groups, L.INDEX_RUN))
+            _rows = max(self.ix_rows(s) for s in self.shapes if not s.prefill)
+            for _bi in (0, 1):
+                _np.save(f"{_td2}/ixmerge{_bi}_{tag}_r{self.rank}.npy", dev.d2h(self.ix_merge[_bi], ((_rows + L.INDEX_RUN) * MAX_T,), np.float32).reshape(MAX_T, _rows + L.INDEX_RUN)[0, :L.INDEX_RUN + 64])
+                _np.save(f"{_td2}/ixpos{_bi}_{tag}_r{self.rank}.npy", dev.d2h(self.ix_pos[_bi], (L.INDEX_RUN * MAX_T,), np.int32).reshape(MAX_T, L.INDEX_RUN)[0])
+            _np.save(f"{_td2}/ixtile_{tag}_r{self.rank}.npy", dev.d2h(self.ix_tile, (_rows * MAX_T,), np.float32).reshape(MAX_T, _rows)[0])
+            _np.save(f"{_td2}/ixq8_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_q8"], (L.INDEX_DIM * L.INDEX_HEADS * MAX_T,), np.uint8).reshape(MAX_T, L.INDEX_DIM * L.INDEX_HEADS)[0])
+            _np.save(f"{_td2}/ixqs_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_qs"], (L.INDEX_HEADS * MAX_T,), np.float32).reshape(MAX_T, L.INDEX_HEADS)[0])
+            _np.save(f"{_td2}/ixw_{tag}_r{self.rank}.npy", dev.d2h(self.io["ix_w"], (L.INDEX_HEADS * MAX_T,), np.float32).reshape(MAX_T, L.INDEX_HEADS)[0])
+            _tb = self.tables[Shape(1, False)] if Shape(1, False) in self.tables else None
+            if _tb is not None:
+                _rec = dev.d2h(self.table + _tb.off["ix1.rec"], (8 * 64,), np.int32).reshape(64, 8)
+                _np.save(f"{_td2}/ixrec1_{tag}_r{self.rank}.npy", _rec)
+                _gb = dev.d2h(self.table + _tb.off["ix1.gb"], (64 * 64,), np.int32).reshape(64, 64)
+                _np.save(f"{_td2}/ixgb1_{tag}_r{self.rank}.npy", _gb)
+            print(f"[ixcap {tag}] saved group0 tiles L{sorted(self.ixcap)} + cand + sparse + list", flush=True)
+          except Exception as _e:
+            print(f"[ixcap {tag}] skipped: {_e}", flush=True)
+        if _os.environ.get("RESIN_DS41_KVCAP"):
+          try:
+            import numpy as _np
+            td = "/tmp/kv-quant-fix/cap"
+            _os.makedirs(td, exist_ok=True)
+            nb = 16  # arena blocks to capture (16384 rows covers needle pages for all owners)
+            b0, b1 = 90, min(self.arena_blocks, 330)
+            ar = dev.d2h(self.arena + b0 * 1024 * 512, ((b1 - b0) * 1024 * 512,), np.uint8)
+            _np.save(f"{td}/arena_{tag}_r{self.rank}.npy", ar)
+            _np.save(f"{td}/arenab0_{tag}_r{self.rank}.npy", np.array(b0, np.int64))
+            # second range covering the >=31k needle pages: dynamic around the ratio1 needle page's block
+            try:
+                _np_pos = int(_os.environ.get("RESIN_DS41_NEEDLE_POS", "16214"))
+                _cb1 = dev.d2h(self.table + self.tables[Shape(1, False)].off["cmp_blocks1"], (self.pages,), np.int32)
+                _pg = _np_pos // PAGE_TOKENS
+                _blk = int(_cb1[_pg]) // 1024
+                c0, c1 = max(0, _blk - 5), min(self.arena_blocks, _blk + 15)
+            except Exception:
+                c0, c1 = 1400, min(self.arena_blocks, 1560)
+            if c1 > c0:
+                ar2 = dev.d2h(self.arena + c0 * 1024 * 512, ((c1 - c0) * 1024 * 512,), np.uint8)
+                _np.save(f"{td}/arena2_{tag}_r{self.rank}.npy", ar2)
+                _np.save(f"{td}/arenab02_{tag}_r{self.rank}.npy", np.array(c0, np.int64))
+            for o in self.geo.owners:
+                lv = dev.d2h(self.loff[o], (64,), np.int32)
+                _np.save(f"{td}/loff{o}_{tag}_r{self.rank}.npy", lv)
+            for nm in ("ix_list", "ix_lslots", "q_all"):
+                pass
+            il = dev.d2h(self.io["ix_list"], (512 * TMAX,), np.int32).reshape(TMAX, 512)
+            _np.save(f"{td}/ixlist_{tag}_r{self.rank}.npy", il)
+            ils = dev.d2h(self.io["ix_lslots"], (8 * TMAX,), np.int32).reshape(TMAX, 8)
+            _np.save(f"{td}/ixls_{tag}_r{self.rank}.npy", ils)
+            for r in (1, 2):
+                key = f"cmp_blocks{r}"
+                for _Tk, _tb in self.tables.items():
+                    _T = _Tk.T
+                    if _T > MAX_T or key not in _tb.off:
+                        continue
+                    off = _tb.off[key]
+                    cb = dev.d2h(self.table + off, (_T * self.pages,), np.int32)
+                    cb = cb.reshape(_T, -1)
+                    _np.save(f"{td}/cmpblocks{r}_T{_T}_{tag}_r{self.rank}.npy", cb)
+            D, nh = self.d.head_dim, self.d.heads
+            try:
+                kc = max(1, self.kc)
+                idx_caps = [("ix_score_sparse", np.float32, kc), ("ix_cpos", np.int32, kc),
+                            ("ix_thr", np.int32, 64), ("cand_thr", np.int32, 64),
+                            ("cand_bmax", np.float32, self.kb),
+                            ("cand_list", np.int32, max(1, self.cfg.candidate_topk_blocks)),
+                            ("ix_w", np.float32, L.INDEX_HEADS)]
+                for nm, dt, n in idx_caps:
+                    if nm in self.io:
+                        a = dev.d2h(self.io[nm], (n,), dt)
+                        _np.save(f"{td}/{nm}_{tag}_r{self.rank}.npy", a)
+                print(f"[kvcap {tag}] cfg cand_topk_blocks={self.cfg.candidate_topk_blocks} "
+                      f"cand_src={self.cfg.candidate_source_layer} index_topk={self.cfg.index_topk} "
+                      f"kc={self.kc} kb={self.kb}", flush=True)
+            except Exception as _ie:
+                print(f"[kvcap {tag}] idxcap skipped: {_ie}", flush=True)
+            try:
+                qa = dev.d2h(self.io["q_all"], (2 * D * nh * TMAX,), np.uint16).reshape(TMAX, nh * D)
+                _np.save(f"{td}/qall_{tag}_r{self.rank}.npy", qa)
+            except Exception as _qe:
+                print(f"[kvcap {tag}] qall skipped: {_qe}", flush=True)
+            print(f"[kvcap {tag}] saved arena{nb}blk ixlist qall cmpblocks loff to {td}", flush=True)
+          except Exception as _e:
+            print(f"[kvcap {tag}] capture skipped: {_e}", flush=True)
+        if _df:
+            _df.close()
+        for k in (0, 1):
+            a = dev.d2h(self.x[k], (4 * H,), np.float32)
+            out[f"x{k}"] = a
+            print(f"[dump {tag}] x[{k}] column 0: norm {np.linalg.norm(a):.4f} "
+                  f"absmax {np.abs(a).max():.4f} finite {np.isfinite(a).all()}")
+        a, b = out["x0"], out["x1"]
+        cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
+        print(f"[dump {tag}] cos(x[0], x[1]) = {cos:.6f}  (1.0 means the layers changed nothing)")
+        logits = dev.d2h(self.logits, (d.vocab,), np.float32)
+        srt = np.sort(logits)[::-1]
+        p = np.exp(logits - logits.max())
+        p /= p.sum()
+        ent = float(-(p * np.log(p + 1e-30)).sum())
+        print(f"[dump {tag}] logits: norm {np.linalg.norm(logits):.3f} top1 {srt[0]:.3f} "
+              f"top2 {srt[1]:.3f} margin {srt[0] - srt[1]:.3f} entropy {ent:.3f} "
+              f"top1 p {p.max():.4f} top5 ids {np.argsort(logits)[::-1][:5].tolist()}")
+        # is the residual (or its mean over the 4 streams) an embedding row?
+        emb = np.asarray(dev.d2h(self.w["emb"], (d.vocab, H), np.float32))
+        h = a.reshape(4, H).mean(0)
+        en = np.linalg.norm(emb, axis=1)
+        num = emb @ h
+        cosr = num / (en * np.linalg.norm(h) + 1e-30)
+        best = int(np.argmax(cosr))
+        print(f"[dump {tag}] |hidden| {np.linalg.norm(h):.4f} vs |emb| median {np.median(en):.4f}: "
+              f"best cosine to any embedding row {cosr[best]:.6f} (row {best})")
+        for k in (0, 1):
+            hk = out[f"x{k}"].reshape(4, H).mean(0)
+            c = emb @ hk / (en * np.linalg.norm(hk) + 1e-30)
+            print(f"[dump {tag}] x[{k}] mean-stream: best embedding cosine {float(c.max()):.6f}")
+        # (a) the four streams the head's collapse mixes: sane individually, or is one of them dead?
+        for k in (0, 1):
+            st = out[f"x{k}"].reshape(4, H)
+            norms = [float(np.linalg.norm(st[i])) for i in range(4)]
+            cs = [(float(st[i] @ st[j] / (norms[i] * norms[j] + 1e-30)), i, j)
+                  for i in range(4) for j in range(i + 1, 4)]
+            print(f"[dump {tag}] x[{k}] stream norms {['%.2f' % n for n in norms]} "
+                  f"pairwise cos max {max(cs)[0]:.4f} min {min(cs)[0]:.4f}")
+        # (b) the final norm's weight, and the residual's RMS (what the head's norm sees)
+        nw = dev.d2h(self.w["norm"], (H,), np.float32)
+        print(f"[dump {tag}] norm weight: mean {nw.mean():.5f} rms {np.sqrt((nw**2).mean()):.5f} "
+              f"min {nw.min():.5f} max {nw.max():.5f}")
+        for k in (0, 1):
+            print(f"[dump {tag}] x[{k}] rms {np.sqrt((out[f'x{k}']**2).mean()):.4f} "
+                  f"rms after norm {np.sqrt(((out[f'x{k}'] * np.tile(nw, 4))**2).mean()):.4f}")
+        # (c) the top-1 GLOBAL token id (the head's output is this rank's vocabulary slice)
+        start = self.sl.vocab.start
+        top = np.argsort(logits)[::-1][:5]
+        from tokenizers import Tokenizer as _Tk
+
+        _tk = _Tk.from_file(str(self.checkpoint / "tokenizer.json"))
+        print(f"[dump {tag}] top-5 global ids {[int(start + t) for t in top]} (slice start {start}) "
+              f"as text {[_tk.decode([int(start + t)]) for t in top]}")
+        # (e) the collapse coefficients the head actually uses, against c_identity
+        for k in (0, 1):
+            cc = dev.d2h(self.cbuf[k], (24,), np.float32)
+            print(f"[dump {tag}] c[{k}] lanes 0..11 {np.round(cc[:12], 4).tolist()}")
+        ident = np.zeros(24, np.float32)
+        ident[0] = 1.0
+        ident[8 + np.arange(4) * 5] = 1.0
+        print(f"[dump {tag}] c_identity lanes 0..11 {np.round(ident[:12], 4).tolist()}")
+        # (d) the head ALONE, on an embedding row: does it produce a sane token from a known input?
+        s1 = Shape(1, False)
+        prog1 = self._programs.get(s1)
+        if prog1 is not None and prog1.head is not None:
+            from tokenizers import Tokenizer
+
+            tk = Tokenizer.from_file(str(self.checkpoint / "tokenizer.json"))
+            xb = dev.malloc(max(256, 16 * H))
+            ob = dev.malloc(max(256, 16 * H))  # the head's X_out, which it also writes
+            lb = dev.malloc(4 * d.vocab)
+            try:
+                for word in ("1", " Paris", " the"):
+                    ids = tk.encode(word).ids
+                    if not ids:
+                        continue
+                    row = dev.d2h(self.w["emb"] + 4 * H * ids[0], (H,), np.float32)
+                    x = np.zeros((4 * H, 1), np.float32)
+                    x[:H, 0] = row
+                    dev.h2d(xb, x)
+                    op = prog1.head
+                    # the program's own bindings first (weights, consts), then the inputs we replace
+                    op.recipe.bind_slots(op.slots, op.addresses)
+                    op.recipe.bind("X", xb)
+                    op.recipe.bind("c", self.c_identity[1])
+                    op.recipe.bind("p", self.pzero)
+                    op.recipe.bind("logits", lb)
+                    op.recipe.bind("X_out", ob)
+                    op.recipe.launch()
+                    dev.sync()
+                    lo = dev.d2h(lb, (d.vocab,), np.float32)
+                    t5 = np.argsort(lo)[::-1][:5]
+                    print(f"[dump {tag}] head alone on emb[{word!r}]: top-5 global "
+                          f"{[int(start + t) for t in t5]} "
+                          f"as text {[tk.decode([int(start + t)]) for t in t5]}")
+            finally:
+                dev.free(xb)
+                dev.free(ob)
+                dev.free(lb)
+
     # ------------------------------------------------------------------ programs
-    def _op(self, recipe: Recipe, layer: int | None, names: dict[str, int]) -> _Op:
+    def _op(
+        self, recipe: Recipe, layer: int | None, names: dict[str, int], copy=None
+    ) -> _Op:
         bound: dict[str, int] = {}
         for n in recipe.persistent:
             if n in names:
@@ -944,7 +1868,32 @@ class DeepSeekV41Gaudi:
                 bound[n] = self.consts[n]
             else:
                 raise ValueError(f"{recipe.name}: unbound {n}")
-        return _Op(recipe, bound)
+        return _IxMergeOp(recipe, bound, copy) if copy else _Op(recipe, bound)
+
+    def _ix_tile_copy(self, s: Shape, g: int, layer: int = -1) -> tuple[list, list, list]:
+        """(src, size, dst) of the per-column copies that place a group's own scores (a (rows, T) tile at
+        ``ix_tile``) at rows ``run`` .. of its merge buffer (a (run + rows, T) tensor), or at rows 0 .. for the
+        first group, which has no running candidates."""
+        T, run = s.T, L.INDEX_RUN
+        rows = self.ix_rows(s)
+        K = run + rows
+        row0 = 0 if g == 0 else run
+        src = [self.ix_tile + 4 * rows * t for t in range(T)]
+        dst = [self.ix_merge[g % 2] + 4 * (K * t + row0) for t in range(T)]
+        sizes = [4 * rows] * T
+        if (g == 0 and not s.prefill and layer in self.ixcap
+                and _os.environ.get("RESIN_DS41_IXCAP")):
+            cap = self.ixcap[layer]
+            src += [self.ix_tile + 4 * rows * t for t in range(T)]
+            dst += [cap + 4 * rows * t for t in range(T)]
+            sizes += [4 * rows] * T
+        if (s.prefill and _os.environ.get("RESIN_DS41_IXCAP") and hasattr(self, "ixcap_pos")
+                and layer == max(self.cfg.index_source_layers)):
+            # running set ENTERING group g (last column): positions + scores, before g's merge
+            src += [self.ix_pos[g % 2] + 4 * run * (T - 1), self.ix_merge[g % 2] + 4 * K * (T - 1)]
+            dst += [self.ixcap_pos + 4 * run * g, self.ixcap_score + 4 * run * g]
+            sizes += [4 * run, 4 * run]
+        return src, sizes, dst
 
     def _program(self, s: Shape) -> _Program:
         if (prog := self._programs.get(s)) is not None:
@@ -974,6 +1923,19 @@ class DeepSeekV41Gaudi:
         prog.embed = self._op(
             self.r["embed", s], None, {**head, "X": x[1], "c": c[1], "X_out": x[0]}
         )
+        if ("ixg", s, 1) in self.r:
+            prog.ixg = [
+                self._op(
+                    self.r["ixg", s, r],
+                    None,
+                    {
+                        "blk": t(f"blk{r}"),
+                        "ix_rec": t(f"ix{r}.rec"),
+                        "ix_gbase": t(f"ix{r}.gb"),
+                    },
+                )
+                for r in (1, 2)
+            ]
         cur, cin, pin = (
             0,
             self.c_identity[s.T],
@@ -981,7 +1943,7 @@ class DeepSeekV41Gaudi:
         )  # the streams, the incoming coefficients and partial
         cnext, pnext = 0, 0
         for layer in range(self.n_layers):
-            ratio = cfg.compress_ratios[layer]
+            ratio = self._ratio(layer)
             cs = "cs1" if ratio else "cs0"
             ops: dict = {}
             common = {
@@ -1078,64 +2040,43 @@ class DeepSeekV41Gaudi:
                         ops["attn_dense"] = self._op(
                             self.r[(*key, "dense")],
                             layer,
-                            {**common, **attn_io, **dense},
+                            {
+                                **common,
+                                **attn_io,
+                                **dense,
+                                "ix_score": self.ix_tile,
+                                "ix_thr": self.io["ix_thr"],
+                            },
                         )
                 else:
                     ops["attn"] = self._op(self.r[key], layer, {**common, **attn_io})
                     if layer in cfg.index_source_layers:
-                        ops["ix"] = [
-                            self._op(self.r["ix", s], layer, self._ix_names(s, ratio, j, owner, head))
-                            for j in range(self.ix_launches(s, ratio))
-                        ]  # fmt: skip
-                        cs = cfg.candidate_source_layer
-                        cand = (
-                            ""
-                            if cs < 0 or layer < cs
-                            else "source"
-                            if layer == cs
-                            else "user"
+                        ops.update(
+                            self._ix_ops(s, ratio, layer, owner, head, tail, t)
                         )
-                        names = {"ix_vis": t(f"ix_vis{ratio}"), "ix_visb": t("ix_visb")}
-                        ops["sel"] = {
-                            radix: self._op(self.r["sel", s, cand, radix], layer, names)
-                            for radix in ((False,) if s.prefill else (False, True))
-                        }
-                        if cand:  # steps where every column's blocks are all candidates
-                            ops["sel"]["all"] = self._op(
-                                self.r["sel", s, "", False], layer, names
-                            )
-                        if ("sel", s, cand, "pf") in self.r:
-                            pf = {
-                                **names,
-                                "ix_visb": t(self._visb(ratio)),
-                                "ix_visc": t("ix_visc"),
-                            }
-                            ops["sel"]["pf"] = self._op(
-                                self.r["sel", s, cand, "pf"], layer, pf
-                            )
-                            if cand:
-                                ops["sel"]["pf_all"] = self._op(
-                                    self.r["sel", s, "", "pf"], layer, pf
-                                )
-                        if cand == "user" and self.ixc_launches(s):
-                            ops["ixc"] = [
-                                self._op(self.r["ixc", s], layer, {**head, **tail, "ix_slots": t(f"ixc.{j}")})
-                                for j in range(self.ixc_launches(s))
-                            ]  # fmt: skip
-                            ops["sel"]["sparse"] = self._op(
-                                self.r["sel", s, "user", "sparse"], layer,
-                                {"ix_vis": t(f"ix_vis{ratio}"), "ix_visc": t("ix_visc")},
-                            )  # fmt: skip
-                    ops["out"] = self._op(
-                        self.r["out", s], layer, {**common, **tail, "p_out": p[pnext]}
-                    )
+                    if s.prefill:
+                        ops["out_tiles"] = self._attn_tile_ops(s, layer, common, tail, t)
+                        ops["out_wo"] = self._op(
+                            self.r["out_wo", s], layer,
+                            {"o_out": self.io["o_out"], "p_out": p[pnext]},
+                        )
+                    else:
+                        ops["out"] = self._op(
+                            self.r["out", s], layer, {**common, **tail, "p_out": p[pnext]}
+                        )
                     if ("out", s, "dense") in self.r:
                         ops["out_dense"] = self._op(
                             self.r["out", s, "dense"],
                             layer,
-                            {**common, **dense, "p_out": p[pnext]},
+                            {
+                                **common,
+                                **dense,
+                                "p_out": p[pnext],
+                                "ix_score": self.ix_tile,
+                                "ix_thr": self.io["ix_thr"],
+                            },
                         )
-            if layer == self.cut and s.prefill:
+            if not WINDOW_ONLY and layer == self.cut and s.prefill:  # (no compressor under the probe)
                 prog.store = self._op(self.r["store", s], layer, {**common, **attn_io})
                 prog.cut = (attn_io["X"], attn_io["c"], attn_io["p"])
             cin, pin = c[cnext], p[pnext]
@@ -1177,6 +2118,8 @@ class DeepSeekV41Gaudi:
         native.section("draft")
 
         def launch(op) -> None:
+            if isinstance(op, _IxMergeOp):  # the group's own scores, at their rows of the merge buffer
+                self.device.d2d_multi(*op.copy)
             native.launch(op.recipe.handle, op.slots.tolist(), op.addresses.tolist())
 
         def reduce(partial: int) -> None:
@@ -1293,6 +2236,10 @@ class DeepSeekV41Gaudi:
         T, ccl = s.T, self.nranks > 1
 
         def launch(op) -> None:
+            if isinstance(op, _IxMergeOp):  # the group's own scores, at their rows of the merge buffer
+                native.copy_multi(
+                    op.copy[0].tolist(), op.copy[1].tolist(), op.copy[2].tolist()
+                )
             native.launch(op.recipe.handle, op.slots.tolist(), op.addresses.tolist())
 
         def reduce(partial: int) -> None:
@@ -1315,48 +2262,57 @@ class DeepSeekV41Gaudi:
                 launch(ops[name])
 
         def index(ratio: int, ops: dict) -> None:
-            """``_run_layer``'s index launches and selection: by candidates in a sparse step, else the first
-            counts[ratio] index launches and the prefiltered, all, or radix selection"""
-            sel, arms = ops["sel"], []
-
-            def arm(register: int, launches: list, select) -> int:
-                arms.append((register, launches, select))
-                return len(arms) - 1
-
-            sparse = arm(_R_IXC, ops["ixc"], sel["sparse"]) if "ixc" in ops and "sparse" in sel else -1
-            every = arm(_R_IX[ratio], ops["ix"], sel["all"]) if "all" in sel else -1
-            radix = [arm(_R_IX[ratio], ops["ix"], sel[r]) if r in sel else -1 for r in (False, True)]
-            pf = arm(_R_IX[ratio], ops["ix"], sel["pf"]) if "pf" in sel else -1
-            pf_all = arm(_R_IX[ratio], ops["ix"], sel["pf_all"]) if "pf_all" in sel else -1
-
-            def chosen(is_sparse: int, cand: int, by_radix: int, prefiltered: int) -> int:
-                if is_sparse and "ixc" in ops:
-                    return sparse
-                if prefiltered and "pf" in sel:
-                    return pf_all if not cand and "pf_all" in sel else pf
-                if not cand and "all" in sel:
-                    return every
-                return radix[by_radix]
-
-            # keys (sparse, cand, radix, prefiltered), the first the most significant; -1: a step _run_layer
-            # cannot make
-            table = [chosen(*key) for key in np.ndindex(2, 2, 2, 2)]
-            keys = [(_R_SPARSE, 2), (_R_CAND, 2), (_R_RADIX[ratio], 2), (_R_PF[ratio], 2)]
-            native.select(keys, table)
-            for register, launches, select in arms:
+            """The tiled index chain: the plain arm (each group's score launches and its merge), the candidate
+            arm (with each group's block maxima or candidate mask, and the tail that publishes the blocks), and
+            the sparse reindex path (its launches over the candidate blocks and their compact selection). The
+            register of each arm takes its groups' launches, so a step runs only the groups it needs."""
+            plain = ops["ixp"]
+            arms = (
+                (plain, _R_IX[ratio], []),
+                (ops.get("ixc2", plain), _R_PF[ratio], ops.get("ixc_tail", [])),
+                (ops.get("ixsp", plain), _R_IXC, ops.get("ixsp_tail", [])),
+            )
+            # a step that needs an arm the layer does not have is an error, not a silent fallback
+            native.select(
+                [(_R_SPARSE, 2), (_R_CAND, 2)],
+                [
+                    0,
+                    1 if "ixc2" in ops else -1,
+                    2 if "ixsp" in ops else 0,
+                    2 if "ixsp" in ops else 1,
+                ],
+            )
+            for arm, register, tail in arms:
                 native.arm()
                 native.take(register)
-                for op in launches:
+                for op in arm:
                     launch(op)
                 native.end()
-                launch(select)
+                for op in tail:
+                    launch(op)
             native.end()
+
 
         native.section("embed")
         launch(prog.embed)
+        # the tiled index chain's group tables: one launch per ratio for the whole step, whatever the number of
+        # merge groups (ds_ix_gslot derives each group's slot records from the step's positions). These share
+        # the embed section: the executor's `_sections` numbering assumes embed=0, layers=1..n, inject=n+1,
+        # head=n+2, head_column=n+3, so a separate index-group section would shift the head/head_column indices
+        # and the sampler would read the wrong logits (prefill and decode both garbled).
+        if prog.ixg:
+            for op in prog.ixg:
+                launch(op)
+        # DIAGNOSTIC: snapshot the fill's ix_vis tables during prefill (post-step dumps are post-decode).
+        if os.environ.get("RESIN_DS41_DUMP") and s.prefill:
+            if not hasattr(self, "_trace_ixvis"):
+                self._trace_ixvis = [self._malloc(4 * TMAX), self._malloc(4 * TMAX)]
+            _tb = self.tables[s]
+            native.copy(self._trace_ixvis[0], self.table + _tb.off["ix_vis1"], 4 * T)
+            native.copy(self._trace_ixvis[1], self.table + _tb.off["ix_vis2"], 4 * T)
         for layer, ops in enumerate(prog.layers):
             native.section(f"layer {layer}")
-            ratio = self.cfg.compress_ratios[layer]
+            ratio = self._ratio(layer)
             if "eg" in ops:
                 if "eg_gather" in ops:
                     launch(ops["eg_gather"])
@@ -1368,9 +2324,65 @@ class DeepSeekV41Gaudi:
                         native.allgather(self.io["eg_kv"], self.io["eg_kv_all"], self.eg_rows_r * T)
                     launch(ops["eg_gate"])
             dense_or(ops, "attn", ratio)
-            if "ix" in ops:
+            if "ixp" in ops:
                 index(ratio, ops)
-            if "out" in ops:
+                if (_os.environ.get("RESIN_DS41_PFLIST") and s.prefill
+                        and layer in getattr(self, "pf_list", {})):
+                    native.copy(self.pf_list[layer], self.io["ix_list"], 4 * L.INDEX_TOP * T)
+                    native.copy(self.pf_lslots[layer], self.io["ix_lslots"], 4 * 8 * T)
+                    native.copy(self.pf_meta, self.table + self.tables[s].off["meta"], 8)
+                    if layer == self.cfg.candidate_source_layer:
+                        native.copy(self.pf_cand, self.io["cand_list"],
+                                    4 * max(1, self.cfg.candidate_topk_blocks) * T)
+                if (_os.environ.get("RESIN_DS41_IXCAP") and s.prefill
+                        and layer == max(self.cfg.index_source_layers)):
+                    native.copy(self.ixcap_list, self.io["ix_list"], 4 * L.INDEX_TOP * T)
+                    native.copy(self.ixcap_tile, self.ix_tile, 4 * self.ix_rows(s) * T)
+                if (_os.environ.get("RESIN_DS41_IXCAP") and not s.prefill
+                        and layer in getattr(self, "ixcap_dl", {})):
+                    native.copy(self.ixcap_dl[layer], self.io["ix_list"], 4 * L.INDEX_TOP * T)
+                    native.copy(self.ixcap_dt[layer], self.ix_tile, 4 * self.ix_rows(s) * T)
+                if _os.environ.get("RESIN_DS41_IXCAP") and layer in getattr(self, "cap", {}):
+                    cp = self.cap[layer]
+                    q8b = L.INDEX_DIM * L.INDEX_HEADS
+                    hsb = 4 * L.INDEX_HEADS
+                    lb = 4 * L.INDEX_TOP
+                    sb = 4 * 8
+                    xb = 4 * self.d.hidden * 4
+                    tb = 4 * self.ix_rows(s)
+                    if not s.prefill:
+                        native.copy(cp["d_q8"], self.io["ix_q8"], q8b)
+                        native.copy(cp["d_qs"], self.io["ix_qs"], hsb)
+                        native.copy(cp["d_w"], self.io["ix_w"], hsb)
+                        native.copy(cp["d_list"], self.io["ix_list"], lb)
+                        native.copy(cp["d_lslots"], self.io["ix_lslots"], sb)
+                        native.copy(cp["d_tile"], self.ix_tile, tb)
+                        native.copy(cp["d_x"], ops["x_ffn"], xb)
+                    else:
+                        native.copy(cp["p_q8"], (self.io["ix_q8"], 7, q8b), q8b)
+                        native.copy(cp["p_qs"], (self.io["ix_qs"], 7, hsb), hsb)
+                        native.copy(cp["p_w"], (self.io["ix_w"], 7, hsb), hsb)
+                        native.copy(cp["p_list"], (self.io["ix_list"], 7, lb), lb)
+                        native.copy(cp["p_lslots"], (self.io["ix_lslots"], 7, sb), sb)
+                        native.copy(cp["p_tile"], (self.ix_tile, 7, tb), tb)
+                        native.copy(cp["p_x"], (ops["x_ffn"], 7, xb), xb)
+            if "out_tiles" in ops:
+                # the bounded stream: T/Q tile launches then the wo projection; the dense arm (short context)
+                # is the alternative the counts register selects
+                if ratio in _R_DENSE and "out_dense" in ops:
+                    native.select([(_R_DENSE[ratio], 2)], [0, 1])
+                    native.arm()
+                    for op in ops["out_tiles"]:
+                        launch(op)
+                    launch(ops["out_wo"])
+                    native.arm()
+                    launch(ops["out_dense"])
+                    native.end()
+                else:
+                    for op in ops["out_tiles"]:
+                        launch(op)
+                    launch(ops["out_wo"])
+            elif "out" in ops:
                 dense_or(ops, "out", ratio)
             if ccl:
                 reduce(ops["p_attn"])
@@ -1408,8 +2420,19 @@ class DeepSeekV41Gaudi:
                 "DeepSeek-V4.1 steps run in the native executor: resin must be built with the gaudi feature"
             ) from error
         cfg, geo = self.cfg, self.geo
+        # host-Engram: the fill gathers + dequantizes the rows from the shared mmap tables in Rust.
+        # One (weight, scale) pair per Engram layer index e (a dummy empty pair for a layer this rank
+        # does not run, which no shape's engram_emb descriptor references).
+        engram_host = None
         if self.engram == "host" and self.engram_layers:
-            raise ValueError("the native fill hashes the Engram rows on the cards (engram='card')")
+            engram_host = []
+            for layer in cfg.engram_layer_ids:
+                if layer in self.eg_host:
+                    engram_host.append(self.eg_host[layer])
+                else:
+                    engram_host.append(
+                        (np.zeros((0, 256), np.uint8), np.zeros((0, 8), np.uint8))
+                    )
         engram = None
         if self.engram_layers:
             h = self._engram_hash()
@@ -1446,7 +2469,8 @@ class DeepSeekV41Gaudi:
             radix_min=RADIX_MIN,
             prefilter=(PREFILTER_BLOCKS, PREFILTER_MIN),
             dense_keys=DENSE_KEYS,
-            geometry=(PAGE_TOKENS, HISTORY_TOKENS, PAGE_ROWS, INDEX_ROWS, INDEX_KEYS, PENDING_SLOTS),
+            geometry=(PAGE_TOKENS, HISTORY_TOKENS, CMP_PAGE_ROWS, INDEX_ROWS, INDEX_KEYS, PENDING_SLOTS),
+            engram_host=engram_host,
         )
         for s, tb in self.tables.items():
             off = tb.off
@@ -1470,9 +2494,22 @@ class DeepSeekV41Gaudi:
                         (off[f"eg.{layer}"], cfg.engram_layer_ids.index(layer))
                         for layer in self.engram_layers
                     ]
-                    if not self.hashed(s)
+                    if self.engram == "card" and not self.hashed(s)
+                    else [],
+                    "engram_emb": [
+                        (off[f"eg.{layer}"], cfg.engram_layer_ids.index(layer))
+                        for layer in self.engram_layers
+                    ]
+                    if self.engram == "host"
                     else [],
                     "ix_slots": s.ix_slots,
+                    "ix_tp": self.ix_tp(s),
+                    "ix_lpg": self.ix_lpg(s),
+                    "ix_chain_g": IX_CHAIN_G,
+                    "ix_rows": self.ix_rows(s),
+                    "blk": (off["blk1"], off["blk2"]),
+                    "ix_rec": (off["ix1.rec"], off["ix2.rec"]),
+                    "ix_gb": (off["ix1.gb"], off["ix2.gb"]),
                     "nbytes": tb.nbytes,
                     "zero": [(int(a), int(b)) for a, b in tb.zero],
                     "tok": off["tok"],
@@ -1487,26 +2524,16 @@ class DeepSeekV41Gaudi:
                     "slots": off["slots"],
                     "rows": [off[f"rows.{layer}"] for layer in layers],
                     "lat": [off[f"lat.{layer}"] for layer in layers],
+                    "wslots": off["wslots"],
+                    "win_pos": [off[f"win_pos.{layer}"] for layer in layers],
                     "ix_visb": off["ix_visb"],
                     "ix_visc": off["ix_visc"],
-                    "ixc": [off[f"ixc.{j}"] for j in range(self.ixc_launches(s))],
+                    "ixsc_rec": off["ixsc.rec"],
+                    "sparse_batch": self.sparse_batch(s),
+                    "ixsc_batches": self.ixsc_batches(s),
+                    "ixc_per_batch": self.ixc_launches(s),
                     "ix_vis": (off["ix_vis1"], off["ix_vis2"]),
                     "cmp_blocks": (off["cmp_blocks1"], off["cmp_blocks2"]),
-                    "ix": tuple(
-                        [off[f"ix{r}.{j}"] for j in range(self.ix_launches(s, r))]
-                        for r in (1, 2)
-                    ),
-                    "ix_owner": tuple(
-                        [
-                            [
-                                off[f"ix{r}.{j}.{o}"]
-                                for o in geo.owners
-                                if cfg.compress_ratios[o] == r
-                            ]
-                            for j in range(self.ix_launches(s, r))
-                        ]
-                        for r in (1, 2)
-                    ),
                     "engram": [
                         (
                             off[f"eg_xh.{layer}"],

@@ -128,7 +128,7 @@ def build_executor(runner):
             io.download(drafts.ctypes.data, m.io["dsp_out"], (0, E.R_TOKBYTES, 1))
             io.record(draft["event"])
         compact = {}
-        if s.prefill and m.cut is not None:
+        if s.prefill and m.cut is not None and prog.cut is not None:
             largest = bucket(m.replay, True)
             for tk in PREFILL_BUCKETS:
                 if tk <= min(s.T, largest):
@@ -176,6 +176,7 @@ def build_executor(runner):
             "draft_tokens": runner.speculative_tokens,
             "dspark_rows": DSPARK_ROWS,
             "engram_n": m.cfg.engram_max_ngram_size - 1,
+            "engram_host": m.engram == "host",
             "spin_ns": int(runtime._SPIN_WAIT * 1e9),
         },
         draft=draft,

@@ -397,6 +397,14 @@ def _rank(
     run = (rank, port, report_path, model, checkpoint, case_values, topology, options)
     from resin_models_gaudi.synapse.runtime import claim_card
 
+    if options.get("trace_dir"):
+        # BEFORE claim_card: it opens the device, and Synapse loads its profiler plugin only when
+        # HABANA_PROFILE is set at the first Synapse call. Enabled later, the plugin is never loaded
+        # and synProfilerStart returns status=18 (synUnsupported) from libSynapse's stub.
+        from resin_models_gaudi.synapse.trace import enable_profiler
+
+        enable_profiler(Path(tempfile.mkdtemp(prefix="resin-synapse-profiler-")))
+
     with claim_card(rank, numa=options["numa"]) as claim:
         if claim is None:
             raise RuntimeError(f"rank {rank} found no free Gaudi card")
@@ -425,11 +433,6 @@ def _run_rank(
     )
 
     spec = get_model(model)
-    if options.get("trace_dir"):
-        from resin_models_gaudi.synapse.trace import enable_profiler
-
-        # The profiler is configured before the device opens and armed per trace.
-        enable_profiler(Path(tempfile.mkdtemp(prefix="resin-synapse-profiler-")))
     groups = native = None
     if topology.world_size > 1 and options.get("step_transport") == "native":
         from resin._resin import GaudiRanks
@@ -510,7 +513,8 @@ def _run_rank(
         max_running_requests=max(case.batch_size for case in cases),
         context_length=capacity,
         # the grid keeps its prompts in the prefix cache
-        prefix_cache=bool(options.get("grid"))
+        prefix_cache=bool(options.get("prefix_cache"))
+        or bool(options.get("grid"))
         or any(case.shared_prefix_tokens for case in cases),
         enable_overlap=options.get("overlap", True),
         scheduler_config=SchedulerConfig(
@@ -729,6 +733,7 @@ def run_benchmark(
     step_transport: Literal["gloo", "native"] = "gloo",
     cache_types: tuple[str | None, str | None] | None = None,
     grid: dict | None = None,
+    prefix_cache: bool | None = None,
 ) -> list[dict]:
     """One load and graph catalog for all compatible points in this sweep.
 
@@ -760,6 +765,7 @@ def run_benchmark(
         trace_dir=trace_dir,
         step_transport=step_transport,
         grid=grid,
+        prefix_cache=prefix_cache,
         assistant_checkpoint=None
         if assistant_checkpoint is None
         else str(assistant_checkpoint),
@@ -943,6 +949,15 @@ def argument_parser() -> argparse.ArgumentParser:
         help="decode batches (default: 1,2,4,8,16,32,64)",
     )
     parser.add_argument("--shared-prefix-tokens", type=int, default=0)
+    parser.add_argument(
+        "--prefix-cache",
+        action="store_true",
+        default=None,
+        help="force the prefix cache on (the shipping server's default). Otherwise it is on only "
+        "for a --grid run or a nonzero --shared-prefix-tokens, which is the historical behaviour; "
+        "the flag matters because the cache also sets the checkpoint alignment the prefill chunker "
+        "rounds to",
+    )
     parser.add_argument(
         "--draft-tokens",
         type=_draft_list,
@@ -1173,6 +1188,7 @@ def _configuration(args):
     options = dict(
         draft_tokens=max(drafts),
         grid=grid,
+        prefix_cache=args.prefix_cache,
         accepted_drafts=args.accepted_drafts,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,

@@ -193,6 +193,10 @@ static bool geom_elem64(const HabanaKernelParams* p, uint64_t is[5], uint32_t* r
 static bool geom_k512(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, false, 0, 0) + 511) / 512; is[1] = sz(p, false, 0, 1); *rank = 2; return true;
 }
+// ds_ix_bmax_nat: input 0 is the (K/8, 8, T) reshape of the tile scores, so K = dim0*8 and the column is dim2
+static bool geom_bmax_nat(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = (sz(p, false, 0, 0) * 8 + 511) / 512; is[1] = sz(p, false, 0, 2); *rank = 2; return true;
+}
 // ix_rcnt: (64, M, T) partial counts, one member per (slice, column)
 static bool geom_rcnt(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = sz(p, true, 0, 1); is[1] = sz(p, true, 0, 2); *rank = 2; return true;
@@ -200,6 +204,10 @@ static bool geom_rcnt(const HabanaKernelParams* p, uint64_t is[5], uint32_t* ran
 // ix_cgather: 64 slab entries (8 candidate blocks, 32 rows of the (256, 1024, S) slab) of a slot per member
 static bool geom_cgather(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = 1; is[1] = sz(p, true, 0, 1) / 32; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
+}
+// ix_cgather_f4: 64 keys (8 blocks) of the (64, 2048, S) code staging per member
+static bool geom_cgather_f4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, true, 0, 1) / 64; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
 }
 // ix_bgather: 64 listed blocks of a column per member (input 1 (NBL, T))
 static bool geom_bgather(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
@@ -209,9 +217,29 @@ static bool geom_bgather(const HabanaKernelParams* p, uint64_t is[5], uint32_t* 
 static bool geom_pairs16(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = 1; is[1] = sz(p, true, 0, 1) / 16; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
 }
+// ds_ix_gather_f4: 32 keys of the (64, C, S) code staging per member
+static bool geom_ix_gather_f4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, true, 0, 1) / 32; is[2] = sz(p, true, 0, 2); *rank = 3; return true;
+}
 // ds_mk_add: 64 vocabulary entries of one rank's slice for one row per member
 static bool geom_mk_add(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, false, 0, 0) + 63) / 64; is[1] = sz(p, true, 0, 1); is[2] = sz(p, false, 0, 2); *rank = 3; return true;
+}
+// ds_ix_gslot: one member per (merge group, slot of that group); params: S2 (lpg*slots), nblk, qb, heads,
+// ratio, keys, run, tp, page. rec (8, groups*S2) -> [groups, S2]
+static bool geom_ix_gslot(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    const int32_t* prm = (const int32_t*)p->nodeParams.nodeParams;
+    const uint64_t S2 = prm[0] > 0 ? uint64_t(prm[0]) : 1;
+    is[0] = (sz(p, true, 0, 1) + S2 - 1) / S2;
+    is[1] = S2;
+    *rank = 2;
+    return true;
+}
+// ix_gvis: one member per column (its outputs are (T,) vectors)
+static bool geom_ix_gvis(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, true, 0, 0);
+    *rank = 1;
+    return true;
 }
 // ix_list
 static bool geom_ix_list(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
@@ -277,8 +305,8 @@ static bool geom_mixp(const HabanaKernelParams* p, uint64_t is[5], uint32_t* ran
 }
 // mhc_mix
 static bool geom_mhc_mix(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
-    const uint64_t T = sz(p, true, 0, 0);
-    if (T > 2) { is[0] = sz(p, true, 0, 1) / 4; is[1] = (T + 3) / 4; *rank = 2; return true; }
+    // one member per output row (column j); the per-column full-store branch is correct for every T
+    // (the T>2 partial-store branch replicated lane 0 into lanes 11-23).
     is[0] = sz(p, true, 0, 1); *rank = 1; return true;
 }
 // kda_ck_step
@@ -345,6 +373,21 @@ static bool geom_gather16(const HabanaKernelParams* p, uint64_t is[5], uint32_t*
 static bool geom_mx4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
     is[0] = (sz(p, true, 0, 0) + 2047) / 2048; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
 }
+// ds_ldec_f4: one column (512 latent elements) of the staging slab per member
+static bool geom_ldec_f4(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = 1; is[1] = sz(p, true, 0, 1); *rank = 2; return true;
+}
+// ds_attn_online / ds_attn_acc / ds_attn_online_fin: one member per (head, tile column); input 1 is the
+// (nh, Q) running stats (max / sscale), so the index space is [nh, Q] regardless of the in/out acc_o split.
+static bool geom_attn_stats(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    is[0] = sz(p, false, 1, 0); is[1] = sz(p, false, 1, 1); *rank = 2; return true;
+}
+// ds_attn_online_init: [nh, Q] from acc_o (D, nh, Q) — output 0 when the buffers are fresh outputs,
+// input 0 when they are passed in place (mla_acc_init style).
+static bool geom_attn_init(const HabanaKernelParams* p, uint64_t is[5], uint32_t* rank) {
+    const bool out = p->outputTensorNr > 0;
+    is[0] = sz(p, out, 0, 1); is[1] = sz(p, out, 0, 2); *rank = 2; return true;
+}
 static GeomFn geom_glm(const char* n) {
     auto is = [&](const char* pre) { return strncmp(n, pre, strlen(pre)) == 0; };
     if (is("mhc_mixp")) return geom_mixp;               // (prefix: before mhc_mix)
@@ -378,6 +421,8 @@ static GeomFn geom_glm(const char* n) {
     if (is("gx_mask")) return geom_gx_mask;
     if (is("mx4_dec")) return geom_mx4;
     if (is("ds_slot_pw1") || is("ds_slot_p1")) return geom_slot_p1;   // (prefix: before ds_slot_pw)
+    if (is("ds_slot_fused_dense")) return geom_slot_p;
+    if (is("ds_slot_fused")) return geom_slot_p1;
     if (is("ds_slot_pw")) return geom_slot_p;
     if (is("ds_slot_pk")) return geom_slot_p;
     if (is("ds_slot_out")) return geom_slot_out;
@@ -390,13 +435,31 @@ static GeomFn geom_glm(const char* n) {
     if (is("ds_slot_mld")) return geom_slot_out;
     if (is("ds_slot_ml")) return geom_slot_out;
     if (is("ds_attn_comb")) return geom_sink2;
+    if (is("ds_attn_fused_dense")) return geom_sink2;
+    if (is("ds_attn_fused")) return geom_sink2;
+    if (is("ds_attn_online_init")) return geom_attn_init;   // (prefix: before ds_attn_online)
+    if (is("ds_attn_online_fin")) return geom_attn_stats;   // (prefix: before ds_attn_online)
+    if (is("ds_attn_online")) return geom_attn_stats;
+    if (is("ds_attn_acc")) return geom_attn_stats;
     if (is("ds_ix_slot_acc")) return geom_ix_slot_acc;
     if (is("ds_ix_qacc")) return geom_ix_qacc;
+    if (is("ds_gather_win_blk")) return geom_mla_gather;
+    if (is("ds_gather_list_blk_f4")) return geom_gather16;  // (prefix: before ds_gather_list)
     if (is("ds_gather_list")) return geom_gather16;
+    if (is("ds_ldec_f4")) return geom_ldec_f4;
+    if (is("ds_gather_dense_f4")) return geom_mla_gather;
     if (is("ds_smean")) return geom_elem64;
     if (is("ds_argmax")) return geom_columns;
     if (is("ds_mk_add")) return geom_mk_add;
+    if (is("ds_ix_merge")) return geom_ix_list;
+    if (is("ds_ix_assemble")) return geom_elem64;
+    if (is("ds_ix_bmax_nat")) return geom_k512;
+    if (is("ds_ix_bmax")) return geom_k512;
+    if (is("ds_ix_pin")) return geom_columns;
+    if (is("ds_ix_gather_f4")) return geom_ix_gather_f4;
     if (is("ds_ix_gather")) return geom_pairs16;
+    if (is("ds_ix_gslot")) return geom_ix_gslot;
+    if (is("ix_gvis")) return geom_ix_gvis;
     return nullptr;
 }
 
@@ -478,6 +541,7 @@ static GeomFn geom_for(const char* n) {
     if (is("ml4_moe_sum") || is("rsum")) return geom_elem;
     if (is("ml4_ix_acc")) return geom_elem64;
     if (is("mla_store")) return geom_mla_store;
+    if (is("ds_store_f4")) return geom_mla_store;
     if (is("mla_slot_out")) return geom_slot_out;
     if (is("mla_gather")) return geom_mla_gather;
     if (is("mla_slot_q")) return geom_slot_q;
@@ -487,6 +551,7 @@ static GeomFn geom_for(const char* n) {
     if (is("ix_bcnt")) return geom_elem64;
     if (is("ix_bmax") || is("ix_cmask")) return geom_k512;
     if (is("ix_rcnt")) return geom_rcnt;
+    if (is("ix_cgather_f4")) return geom_cgather_f4;
     if (is("ix_cgather")) return geom_cgather;
     if (is("ix_bgather")) return geom_bgather;
     if (is("ix_cfix")) return geom_k512;
@@ -573,6 +638,57 @@ static void ap_gather8(const HabanaKernelParams* p, HabanaKernelInstantiation* i
     o.allRequired = 0;
     amap(o, 0, 0, D, 0, D - 1); amap(o, 1, 1, 8, 0, 7); amap(o, 2, 2, 1, 0, 0);
 }
+// ds_gather_list_f4 staging: codes (256, C, T) + scales (32, C, T), 16 keys a member
+static void ap_gather_list_f4(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    TensorAccessPattern& c = inst->outputTensorAccessPattern[0];
+    c.allRequired = 0;
+    amap(c, 0, 0, 256, 0, 255); amap(c, 1, 1, 16, 0, 15); amap(c, 2, 2, 1, 0, 0);
+    TensorAccessPattern& s = inst->outputTensorAccessPattern[1];
+    s.allRequired = 0;
+    amap(s, 0, 0, 32, 0, 31); amap(s, 1, 1, 16, 0, 15); amap(s, 2, 2, 1, 0, 0);
+}
+// ds_gather_list_blk_f4 staging: codes (256, B, Q) + scales (32, B, Q) + idx (B, Q), 16 keys a member
+static void ap_gather_list_blk_f4(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    TensorAccessPattern& c = inst->outputTensorAccessPattern[0];
+    c.allRequired = 0;
+    amap(c, 0, 0, 256, 0, 255); amap(c, 1, 1, 16, 0, 15); amap(c, 2, 2, 1, 0, 0);
+    TensorAccessPattern& s = inst->outputTensorAccessPattern[1];
+    s.allRequired = 0;
+    amap(s, 0, 0, 32, 0, 31); amap(s, 1, 1, 16, 0, 15); amap(s, 2, 2, 1, 0, 0);
+    TensorAccessPattern& x = inst->outputTensorAccessPattern[2];
+    x.allRequired = 0;
+    amap(x, 0, 1, 16, 0, 15); amap(x, 1, 2, 1, 0, 0);
+}
+// ds_gather_win_blk: ks_blk (D, B, Q) bf16 + idx (B, Q) i32, 32 keys a member (mla_gather layout)
+static void ap_gather_win_blk(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    const int D = int(sz(p, true, 0, 0));
+    TensorAccessPattern& o = inst->outputTensorAccessPattern[0];
+    o.allRequired = 0;
+    amap(o, 0, 0, D, 0, D - 1); amap(o, 1, 1, 32, 0, 31); amap(o, 2, 2, 1, 0, 0);
+    TensorAccessPattern& x = inst->outputTensorAccessPattern[1];
+    x.allRequired = 0;
+    amap(x, 0, 1, 32, 0, 31); amap(x, 1, 2, 1, 0, 0);
+}
+// ds_ldec_f4: dequant one column of codes (256) + scales (32) -> 512 bf16
+static void ap_ldec_f4(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    for (int t = 0; t < 2; t++) {
+        TensorAccessPattern& w = inst->inputTensorAccessPattern[t];
+        w.allRequired = 0;
+        amap(w, 0, 0, t ? 32 : 256, 0, t ? 31 : 255); amap(w, 1, 1, 1, 0, 0);
+    }
+    TensorAccessPattern& o = inst->outputTensorAccessPattern[0];
+    o.allRequired = 0;
+    amap(o, 0, 0, 512, 0, 511); amap(o, 1, 1, 1, 0, 0);
+}
+// ds_gather_dense_f4 staging: codes (256, C, S) + scales (32, C, S), 32 keys a member
+static void ap_gather_dense_f4(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
+    TensorAccessPattern& c = inst->outputTensorAccessPattern[0];
+    c.allRequired = 0;
+    amap(c, 0, 0, 256, 0, 255); amap(c, 1, 1, 32, 0, 31); amap(c, 2, 2, 1, 0, 0);
+    TensorAccessPattern& s = inst->outputTensorAccessPattern[1];
+    s.allRequired = 0;
+    amap(s, 0, 0, 32, 0, 31); amap(s, 1, 1, 32, 0, 31); amap(s, 2, 2, 1, 0, 0);
+}
 static void ap_mla_slot_q(const HabanaKernelParams* p, HabanaKernelInstantiation* inst) {
     const int D = int(sz(p, true, 0, 0));
     TensorAccessPattern& o = inst->outputTensorAccessPattern[0];
@@ -628,7 +744,12 @@ static ApFn ap_for(const char* n) {
     if (strncmp(n, "lq_qdqp_", 8) == 0) return ap_qdqp;
     if (strcmp(n, "mla_slot_q") == 0) return ap_mla_slot_q;
     if (strcmp(n, "mla_gather") == 0 || strcmp(n, "mla_gather_list") == 0) return ap_mla_gather;
+    if (strcmp(n, "ds_gather_dense_f4") == 0) return ap_gather_dense_f4;
     if (strcmp(n, "ds_gather_list") == 0) return ap_gather8;
+    if (strcmp(n, "ds_gather_list_f4") == 0) return ap_gather_list_f4;
+    if (strcmp(n, "ds_gather_list_blk_f4") == 0) return ap_gather_list_blk_f4;
+    if (strcmp(n, "ds_gather_win_blk") == 0) return ap_gather_win_blk;
+    if (strcmp(n, "ds_ldec_f4") == 0) return ap_ldec_f4;
     if (strcmp(n, "attn_slot_q") == 0) return ap_slot_q;
     if (strcmp(n, "kv_gather") == 0 || strcmp(n, "kv_gather8") == 0) return ap_kv_gather;
     return nullptr;

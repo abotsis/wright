@@ -63,9 +63,11 @@ class DeepSeekV41GaudiRunner:
         parent_capacity: int | None = None,
         num_layers: int | None = None,
         engram: str = "card",
+        engram_prewarm: bool = True,
         draft_tokens: int = 0,
         replay: int | None = None,
         defer_cache: bool = False,
+        prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         native_ranks=None,
         log=info,
     ) -> None:
@@ -83,6 +85,7 @@ class DeepSeekV41GaudiRunner:
         self.replay = replay
         if max_batch_size > MAX_BATCH:
             raise ValueError(f"max_batch_size exceeds {MAX_BATCH}")
+        self.prefill_chunk_size = prefill_chunk_size
         self.groups = groups
         self.native_ranks = native_ranks
         if native_ranks is not None:
@@ -141,7 +144,7 @@ class DeepSeekV41GaudiRunner:
         self.model = DeepSeekV41Gaudi(
             self.device, checkpoint, cfg, capacity=self._fit, max_seq_len=max_seq_len, rank=rank, nranks=nranks,
             layers=num_layers, engram=engram, barrier=barrier, log=log if rank == 0 else (lambda *_: None),
-            dspark=speculative, replay=replay, defer_cache=True,
+            dspark=speculative, replay=replay, defer_cache=True, engram_prewarm=engram_prewarm,
         )  # fmt: skip
         if barrier is not None:
             barrier()
@@ -205,8 +208,8 @@ class DeepSeekV41GaudiRunner:
             self.cache_layout, resource="DeepSeek-V4.1-Flash Gaudi cache"
         )
         self.runner_config = RunnerConfig(
-            max_batch_tokens=PREFILL_CHUNK_SIZE,
-            prefill_chunk_size=PREFILL_CHUNK_SIZE,
+            max_batch_tokens=self.prefill_chunk_size,
+            prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
             cache_write_lookahead_tokens=self.lookahead,
             draft_tokens=self.speculative_tokens,
@@ -225,6 +228,36 @@ class DeepSeekV41GaudiRunner:
         # release
         self.executor = build_executor(self)
         self.forward = self.executor.forward
+        if __import__("os").environ.get("RESIN_DS41_TIMINGS"):
+            import time as _t
+            _fwd = self.forward
+            def _timed_forward(plan, *args, **kwargs):
+                t0 = dict(self.executor.timings)
+                w0 = _t.perf_counter()
+                out = _fwd(plan, *args, **kwargs)
+                w1 = _t.perf_counter()
+                t1 = self.executor.timings
+                d = {k: round((t1[k] - t0[k]) / 1e6, 1) for k in t1}
+                d["wall"] = round((w1 - w0) * 1e3, 1)
+                d["phase"] = str(getattr(plan, "phase", "?"))
+                print(f"TIMINGS {d}", flush=True)
+                return out
+            self.forward = _timed_forward
+        if __import__("os").environ.get("RESIN_DS41_IXCAP"):
+            _fwd2 = self.forward
+            _os = __import__("os")
+            _flag = _os.environ.get("RESIN_DS41_IXCAP_FLAG", "")
+            def _cap_forward(plan, *args, **kwargs):
+                out = _fwd2(plan, *args, **kwargs)
+                if _flag and _os.path.exists(_flag):
+                    _ph = str(getattr(plan, "phase", "")).upper()
+                    if "PREFILL" in _ph:
+                        self.model.dump_full("prefill")
+                    elif "DECODE" in _ph:
+                        _os.remove(_flag)
+                        self.model.dump_full("dec0")
+                return out
+            self.forward = _cap_forward
         self.enqueue = self.executor.enqueue
         self.release = self.executor.release
         self.metrics_snapshot = self.executor.metrics_snapshot  # the Engine's metrics, no Python
@@ -232,6 +265,24 @@ class DeepSeekV41GaudiRunner:
         if self.native_ranks is not None:
             self.executor.attach_ranks(self.native_ranks)
         self.compiles_at_start = self._compiles_seen = self.device.compile_count
+        if __import__("os").environ.get("RESIN_DS41_DUMP"):
+            import threading
+            import time as _t
+            _dump_path = __import__("os").environ.get("RESIN_DS41_DUMP_PATH", "")
+            if _dump_path:
+                def _dump_loop():
+                    p = _dump_path
+                    last = 0
+                    while True:
+                        try:
+                            m = __import__("os").path.getmtime(p)
+                            if m > last:
+                                last = m
+                                self.model.dump_step("req")
+                        except FileNotFoundError:
+                            pass
+                        _t.sleep(0.5)
+                threading.Thread(target=_dump_loop, daemon=True).start()
 
     @property
     def kv_pool_bytes(self) -> int:

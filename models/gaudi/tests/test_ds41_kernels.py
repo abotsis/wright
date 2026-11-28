@@ -245,14 +245,22 @@ def mx4_values(codes: np.ndarray, scales: np.ndarray) -> np.ndarray:
 @pytest.mark.parametrize(
     "lo, hi", [(117, 125), (106, 113)], ids=["clamped", "unclamped"]
 )
-def test_expert_block_matches_numpy(device, recipes, lo, hi):
+@pytest.mark.parametrize(
+    "w0, t", [(512, 64), (256, 32)], ids=["bf16-w13-4-rank", "f32-w13-8-rank"]
+)
+def test_expert_block_matches_numpy(device, recipes, lo, hi, w0, t):
     """Routed experts of one rank: FP8 input, mx4_decs into (token, route) slots, NT batch_gemm, clamped
     SwiGLU (natural order, tail rows in y), mx4_decs, NT batch_gemm, weighted sum. Scales lo..hi set
-    whether the clamp at 10 acts."""
-    from resin_models_gaudi.synapse.runtime import F8, F32, I32, U8
+    whether the clamp at 10 acts.
+
+    The w2 product is always BF16 and the w13 one wherever the SwiGLU kernel can read a bf16 tile (the
+    4-rank width, ``w = 576``): BF16 is the reference's own expert output dtype, so the oracle rounds each
+    product to bf16 the same way and the tolerance is not loosened for it."""
+    from resin_models_gaudi.loading.convert import bf16_rne
+    from resin_models_gaudi.synapse.runtime import BF16, F8, F32, I32, U8
 
     rng = np.random.default_rng(5)
-    H, w0, t, E, T, R, lim = 5120, 256, 32, 8, 3, 6, 10.0
+    H, E, T, R, lim = 5120, 8, 3, 6, 10.0
     w, S = w0 + t, R * T
     # w13 slot rows: gate 0..w0 | up 0..w0 | gate w0..w | up w0..w; w2 slot: (H rows, w inputs)
     c13 = rng.integers(0, 256, (E, 2 * w * H // 2), dtype=np.uint8)
@@ -260,6 +268,14 @@ def test_expert_block_matches_numpy(device, recipes, lo, hi):
     c2 = rng.integers(0, 256, (E, H * w // 2), dtype=np.uint8)
     s2 = rng.integers(lo, hi, (E, H * w // 32), dtype=np.uint8)
     k13, k2 = int(s13.max()) - 132, int(s2.max()) - 132
+    # the down-projection weights are stored in the row order the bf16 reader inverts (weights.even_odd_rows)
+    from resin_models_gaudi.deepseek_v41.weights import even_odd_rows
+
+    order = even_odd_rows(H)
+    c2n, s2n = c2, s2  # natural row order: the oracle's (the reader inverts the stored order)
+    c2 = np.ascontiguousarray(c2.reshape(E, H, w // 2)[:, order]).reshape(E, -1)
+    s2 = np.ascontiguousarray(s2.reshape(E, H, w // 32)[:, order]).reshape(E, -1)
+    sh = rng.standard_normal((T, H)).astype(np.float32)
     x = rng.standard_normal((T, H)).astype(np.float32)
     ids = np.full((T, 64), -1, np.int32)
     ids[:, :R] = np.stack([rng.choice(E, R, replace=False) for _ in range(T)])
@@ -272,7 +288,8 @@ def test_expert_block_matches_numpy(device, recipes, lo, hi):
         hidden=H, heads=8, head_dim=512, q_lora=1024, o_lora=1024, groups=1, expert=w, experts=E, top=R,
         vocab=16160, eps=1e-6, hc_iters=20, hc_eps=1e-6, limit=lim, route_scale=1.5, ranks=1,
     )  # fmt: skip
-    g = L.LayerGraph(device, "t_ds41_experts", d, T)
+    g = L.LayerGraph(device, f"t_ds41_experts_w{w}", d, T)
+    dt = L.expert_out_dtype(g)
     X = g.input("x", (H, T), F32)
     xq, sx = g.tensor((H, 1, S), F8), g.tensor((1, T), F32)
     g.node("rg_ds_xq_lin_f32", [X], [xq, sx], struct.pack("i", R))
@@ -280,11 +297,11 @@ def test_expert_block_matches_numpy(device, recipes, lo, hi):
     W2 = g.input("c2", (H * w // 2, E), U8)
     S2 = g.input("s2", (H * w // 32, E), U8)
     K2 = g.input("k2", (E,), I32)
-    y13 = L._w13(g, xq, IDS, R)  # each slot's rows 0..w-1 and w..2w-1 apart
+    y13 = L._w13(g, xq, IDS, R, dt)  # each slot's rows 0..w-1 and w..2w-1 apart
     C13 = g.input("cc13", (2 * w, E), F32)
     hq, hs = g.tensor((w, 1, S), F8), g.tensor((1, S), F32)
     g.node(
-        "rg_ds_xact_lin_f32",
+        L._xact_lin(dt),
         [y13, y13, C13, sx, IDS],
         [hq, hs],
         struct.pack("ifii", R, lim, t, 0),
@@ -293,12 +310,12 @@ def test_expert_block_matches_numpy(device, recipes, lo, hi):
     g.node("rg_mx4_decs_f32", [W2, S2, IDS, K2], [d2], struct.pack("ii", R, 0))
     v2 = g.tensor((w, H, S), F8)
     g.node("reshape", [d2], [v2])
-    y2 = g.tensor((H, 1, S), F32)
+    y2 = g.tensor((H, 1, S), BF16)
     g.node("batch_gemm", [hq, v2], [y2], struct.pack("??", False, True))
     C2 = g.input("cc2", (H, E), F32)
-    SH, SHS = g.input("sh", (H, T), F32), g.input("shs", (1, T), F32)
+    SH, SHS = g.input("sh", (H, T), BF16), g.input("shs", (1, T), F32)
     g.node(
-        "rg_ds_xsum_f32",
+        "rg_ds_xsum_b16_f32",
         [y2, C2, hs, IDS, WTS, SH, SHS],
         [g.input("out", (H, T), F32)],
         struct.pack("i", R),
@@ -306,12 +323,12 @@ def test_expert_block_matches_numpy(device, recipes, lo, hi):
     out = Run(device, recipes, g.g)(
         {"x13": c13, "x13.s": s13, "x": x, "ids": ids, "wts": wts, "c2": c2, "x13.k": np.full(E, k13, np.int32), "k2": np.full(E, k2, np.int32), "s2": s2,
          "cc13": np.full((E, 2 * w), 2.0**k13, np.float32), "cc2": np.full((E, H), 2.0**k2, np.float32),
-         "sh": np.zeros((T, H), np.float32), "shs": np.ones((1, T), np.float32)},
+         "sh": bf16_rne(np.ascontiguousarray(sh[:, order])), "shs": np.ones((1, T), np.float32)},
         ["out"],
     )["out"]  # fmt: skip
 
     # numpy: the same FP8 roundings of the activations, f64 sums
-    want = np.zeros((T, H))
+    want = bf16_round(sh).astype(np.float64)  # the shared expert's bf16 product (shs = 1)
     for tk in range(T):
         scale = pow2_scale(float(np.abs(x[tk]).max()))
         xv = fp8_value(fp8_byte(x[tk] / scale, np.zeros(H, np.int64))) * scale
@@ -321,18 +338,23 @@ def test_expert_block_matches_numpy(device, recipes, lo, hi):
                 c13[e].reshape(2 * w, H // 2), s13[e].reshape(2 * w, H // 32)
             )
             y = W @ xv
+            if dt == BF16:  # the reference's expert output dtype: one rounding of the product
+                y = bf16_round(y)
             gate = np.concatenate([y[:w0], y[2 * w0 : 2 * w0 + t]])
             up = np.concatenate([y[w0 : 2 * w0], y[2 * w0 + t :]])
             gate = np.minimum(gate, lim)
             h = gate / (1 + np.exp(-gate)) * np.clip(up, -lim, lim)
             hsc = pow2_scale(float(np.abs(h).max()))
             hv = fp8_value(fp8_byte(h / hsc, np.zeros(w, np.int64))) * hsc
-            W2v = mx4_values(c2[e].reshape(H, w // 2), s2[e].reshape(H, w // 32))
-            want[tk] += wts[tk, r] * (W2v @ hv)
+            W2v = mx4_values(c2n[e].reshape(H, w // 2), s2n[e].reshape(H, w // 32))
+            want[tk] += wts[tk, r] * bf16_round(W2v @ hv)
     err = np.linalg.norm(out - want) / np.linalg.norm(want)
     clamped = (lo, hi) == (117, 125)
     assert err < 2e-3, f"relative error {err:.2e}"
-    print(f"relative error {err:.2e} ({'clamped' if clamped else 'unclamped'})")
+    print(
+        f"w={w}: relative error {err:.2e} ({'clamped' if clamped else 'unclamped'}, w13 "
+        f"{'bf16' if dt == BF16 else 'f32'}, w2 bf16)"
+    )
 
 
 def test_ds_q8_p2_power_of_two_scales(device, recipes):
@@ -1346,11 +1368,13 @@ def test_candidate_blocks_mask(device, recipes):
     g = Graph(device, "t_ds41_candidates")
     sc, V, VB = g.input("score", (K, T), F32), g.input("vis", (T,), I32), g.input("visb", (T,), I32)
     bmax, cthr = g.input("bmax", (K // 8, T), F32), g.input("cthr", (64, T), I32)
+    gb = g.input("gbase", (1,), I32)
     g.node("rg_ix_bmax_f32", [sc, V], [bmax])
     g.node("rg_ix_thr_f32", [bmax, VB], [cthr], struct.pack("i", top))
-    g.node("rg_ix_cmask_f32", [sc, V, bmax, cthr], [g.input("out", (K, T), F32)])
+    g.node("rg_ix_cmask_f32", [sc, V, bmax, cthr, gb], [g.input("out", (K, T), F32)])
     arrays = {"score": score, "vis": vis, "visb": visb, "bmax": np.zeros((T, K // 8), np.float32),
-              "cthr": np.zeros((T, 64), np.int32), "out": np.zeros((T, K), np.float32)}  # fmt: skip
+              "cthr": np.zeros((T, 64), np.int32), "out": np.zeros((T, K), np.float32),
+              "gbase": np.zeros(1, np.int32)}  # fmt: skip
     addr = {}
     try:
         for name, a in arrays.items():
@@ -1577,6 +1601,61 @@ def test_candidate_select_maps_positions(device, recipes):
         assert set(got.tolist()) == want, t
 
 
+def test_candidate_select_maps_long_positions(device, recipes):
+    """ix_list_map at a 512k context: a ratio-1 layer's compressed positions reach 524287, and a listed entry
+    comes back as that position whole. The map variant used to keep the position in a 18-bit field beside the
+    compact row index, so every position at or past 262144 was silently truncated (524287 became 262143) and the
+    attention gathered the wrong latents. The first column holds the highest score at 524287 and the next at
+    300000, so a truncated field cannot produce the wanted set; the last column is a short-context control."""
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F32, I32
+
+    rng = np.random.default_rng(11)
+    KC, T, top = 4608, 3, 512  # a prefilter step's compact entries (PREFILTER_BLOCKS * 8)
+    ctx = 524288  # a 512k context: ratio-1 positions 0 .. 524287
+    score = rng.standard_normal((T, KC)).astype(np.float32)
+    cpos = np.empty((T, KC), np.int32)
+    pool = np.setdiff1d(np.arange(ctx, dtype=np.int32), [300000, 524287])
+    for t in range(2):
+        # distinct positions over the whole context, 300000 and 524287 among them, carrying the two highest
+        # scores so a truncated field cannot produce the wanted set
+        cpos[t] = np.sort(np.concatenate([rng.choice(pool, KC - 2, replace=False), [300000, 524287]]))
+        score[t, np.searchsorted(cpos[t], 524287)] = 100.0
+        score[t, np.searchsorted(cpos[t], 300000)] = 99.0
+    cpos[2] = np.sort(rng.choice(16384, KC, replace=False)).astype(np.int32)  # the short-context control
+    vis = np.array([ctx, ctx, 16384], np.int32)
+    g = Graph(device, "t_ds41_cselect_long")
+    sc, cp, V = g.input("score", (KC, T), F32), g.input("cpos", (KC, T), I32), g.input("vis", (T,), I32)
+    VC = g.input("visc", (T,), I32)
+    m = g.tensor((KC, T), F32)
+    g.node("rg_ix_cfix_f32", [sc, cp, V], [m])
+    thr = g.tensor((64, T), I32)
+    g.node("rg_ix_thr_f32", [m, VC], [thr], struct.pack("i", top))
+    cnt, gsum = g.tensor((KC // 64, T), I32), g.tensor((-(-KC // 4096), T), I32)  # ceil(KC/4096) rows: the kernel reads ceil(nb/64)
+    g.node("rg_ix_bcnt_f32", [m, VC, thr], [cnt, gsum])
+    g.node("rg_ix_list_map_f32", [m, VC, thr, cnt, gsum, cp],
+           [g.input("list", (top, T), I32), g.input("lslots", (8, T), I32)], struct.pack("iii", max(1, 48 // T), top, 8))  # fmt: skip
+    out = run_graph(device, recipes, g, {
+        "score": score, "cpos": cpos, "vis": vis, "visc": np.full(T, KC, np.int32),
+        "list": np.zeros((T, top), np.int32), "lslots": np.zeros((T, 8), np.int32)}, ["list", "lslots"])  # fmt: skip
+    for t in range(T):
+        live = cpos[t] < vis[t]
+        order = np.argsort(-np.where(live, score[t], -np.inf), kind="stable")[:top]
+        want = set(cpos[t, order[live[order]]].tolist())
+        n = int(out["lslots"][t, 4])
+        assert n == top, (t, n)
+        got = set(out["list"][t, :n].tolist())
+        assert got == want, (t, sorted(want - got)[:8], sorted(got - want)[:8])
+        # The list is ascending in position except the final two slots, where the last block fills from both ends
+        # (a pre-existing fill artefact, present on a short context too, and harmless: the consumers treat the
+        # list as a set). The set and the count are the contract, so they are what this gate asserts.
+    # the positions the old 18-bit field truncated come back as themselves, not as position & 0x3FFFF
+    listed = [set(out["list"][t, :top].tolist()) for t in range(T)]
+    assert {524287, 300000} <= listed[0], sorted(listed[0])[-4:]
+    assert {524287, 300000} <= listed[1], sorted(listed[1])[-4:]
+    assert 524287 not in listed[2] and 300000 not in listed[2]
+
+
 def fp8_rows(keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Keys (n, 128) as FP8 bytes with a power-of-two scale each (mla_store_i8's storage)."""
     s = np.array([pow2_scale(float(np.abs(k).max())) for k in keys])
@@ -1604,12 +1683,19 @@ def test_index_keys_fp8_store_and_gather(device, recipes):
     sink = g.input("sink", (64, 1), I32)
     g.node("rg_mla_store_i8_f32", [arena, g.input("rows", (8, T), I32), g.input("kn", (512, T), F32),
                                    g.input("ix", (128, T), F32)], [sink])  # fmt: skip
-    g.node("rg_ds_ix_gather_f32", [arena, g.input("pages", (1, 1), I32), g.input("slots", (8, 1), I32), sink],
-           [g.input("out", (256, 64, 1), F8), g.input("scales", (128, 1), F32)])  # fmt: skip
+    # the gather reads the step's compressed-page table (one arena row per page per column) plus the owner's
+    # latent offset, not a per-slot page table: entry [pbase + page][col] is the page's first arena row less
+    # ``ioff`` (the owner's offset plus PAGE_ROWS), and slot lane 7 is the tile's first page.
+    g.node("rg_ds_ix_gather_f32",
+           [arena, g.input("cmp_blocks", (1, T), I32), g.input("slots", (8, 1), I32), sink,
+            g.input("loff", (64,), I32)],
+           [g.input("out", (256, 64, 1), F8), g.input("scales", (128, 1), F32)],
+           struct.pack("i", 129))  # fmt: skip
     klen = 100
     out = run_graph(device, recipes, g, {
         "arena": np.zeros((NB, PR, 512), np.uint8), "sink": np.zeros((1, 64), np.int32), "rows": rows,
-        "kn": np.zeros((T, 512), np.float32), "ix": keys.astype(np.float32), "pages": np.array([[B]], np.int32),
+        "kn": np.zeros((T, 512), np.float32), "ix": keys.astype(np.float32),
+        "cmp_blocks": np.full((1, T), B - 129, np.int32), "loff": np.array([0] + [-1] * 63, np.int32),
         "slots": np.array([[0, 0, 0, 0, klen, 0, 1, 0]], np.int32), "out": np.full((1, 64, 256), 0x55, np.uint8),
         "scales": np.full((1, 128), -1.0, np.float32)}, ["out", "scales"])  # fmt: skip
     out["out"] = out["out"].reshape(1, 128, 128)
@@ -1637,7 +1723,7 @@ def test_index_scores_fp8(device, recipes):
     flat = arena.reshape(-1, 512)
     pages = np.zeros((S, C // 128), np.int32)
     for p in range(nkeys // 128):
-        r0 = 40 * p + 3
+        r0 = 40 * p + 200  # above PAGE_ROWS: the page table stores the row less ioff
         pages.reshape(-1)[p] = r0
         flat[r0 : r0 + 32] = kb[128 * p : 128 * (p + 1)].reshape(32, 512)
         flat[r0 + 32, :512] = ks[128 * p : 128 * (p + 1)].view(np.uint8)
@@ -1651,15 +1737,25 @@ def test_index_scores_fp8(device, recipes):
     q8, qsc = g.tensor((128, NH, S), F8), g.tensor((NH, S), F32)
     g.node("rg_ix_slot_q8_f32", [g.input("q", (128, NH * T), F8), g.input("qs", (NH * T,), F32), tab], [q8, qsc])
     k8w, k8, ksc = g.tensor((256, C // 2, S), F8), g.tensor((128, C, S), F8), g.tensor((C, S), F32)
-    g.node("rg_ds_ix_gather_f32", [g.input("arena", (512, PR, NB), U8), g.input("pages", (C // 128, S), I32), tab,
-                                   g.input("dep", (64,), I32)], [k8w, ksc])  # fmt: skip
+    # the gather reads the compressed-page table (per column, one arena row per page) and the owner's latent
+    # offset: cmp_blocks[pbase + page][col] is the page's first arena row less ioff (owner offset + PAGE_ROWS)
+    # ioff = loff[0] + PAGE_ROWS: with loff[0] = -PAGE_ROWS the table holds each page's first arena row
+    # directly, which is what this test's `pages` already is.  The graph tensor is (pages, T) and its element
+    # (page, col) lives at page + pages*col, so the flat order is `pages` (which is (S, pages)) read straight
+    # through -- not its transpose.
+    cmp_blocks = np.ascontiguousarray(pages).reshape(C // 128, S)
+    g.node("rg_ds_ix_gather_f32",
+           [g.input("arena", (512, PR, NB), U8), g.input("cmp_blocks", (C // 128, S), I32), tab,
+            g.input("dep", (64,), I32), g.input("loff", (64,), I32)],
+           [k8w, ksc], struct.pack("i", 129))  # fmt: skip
     g.node("reshape", [k8w], [k8])
     sc = g.tensor((C, NH, S), F32)
     g.node("batch_gemm", [q8, k8], [sc], GEMM_NT)
     g.node("rg_ds_ix_slot_acc8_f32", [sc, g.input("w", (NH, T), F32), tab, g.input("score", (C * S, T), F32),
                                       qsc, ksc], [g.input("sink", (64, 1), I32)], struct.pack("f", 1.0 / 64))  # fmt: skip
     out = run_graph(device, recipes, g, {
-        "slots": slots, "q": qb, "qs": qs, "arena": arena, "pages": pages, "dep": np.zeros(64, np.int32),
+        "slots": slots, "q": qb, "qs": qs, "arena": arena, "cmp_blocks": cmp_blocks,
+        "dep": np.zeros(64, np.int32), "loff": np.array([-129] + [-1] * 63, np.int32),
         "w": w, "score": np.zeros((T, C * S), np.float32), "sink": np.zeros((1, 64), np.int32)}, ["score"])  # fmt: skip
     for s in range(S):
         kk = keys[C * s : C * (s + 1)]
@@ -1785,7 +1881,14 @@ def ds41_dims(ranks: int = 1):
     )  # fmt: skip
 
 
-@pytest.mark.parametrize("cand", ["", "source", "user"])
+@pytest.mark.parametrize(
+    "cand",
+    [
+        "",
+        "source",
+        "user",
+    ],
+)
 def test_prefilter_selection_lists_the_plain_entries(device, recipes, cand):
     """index_select_graph with the block prefilter (the entries of each column's 576 blocks of 8 with the largest
     maxima, packed by ix_bgather) lists the same entries as the plain selection, with ties."""
@@ -1798,8 +1901,9 @@ def test_prefilter_selection_lists_the_plain_entries(device, recipes, cand):
     score[:, ::5] = np.round(score[:, ::5], 1)  # ties
     vis = (12000 + 400 * np.arange(T)).astype(np.int32)
     nb = -(-vis // 8)
+    # ix_gbase: the candidate mask (rg_ix_cmask) reads the group's first key as well as the visible counts
     base = {"ix_score": score, "ix_vis": vis, "ix_visb": np.minimum(-(-nb // 64) * 64, K // 8).astype(np.int32),
-            "ix_visc": np.full(T, 8 * PF, np.int32)}  # fmt: skip
+            "ix_visc": np.full(T, 8 * PF, np.int32), "ix_gbase": np.zeros(1, np.int32)}  # fmt: skip
     d = ds41_dims()
     if cand == "user":  # the candidate blocks of a source over other scores
         src = L.index_select_graph(device, d, T, K, "source", top, cand_blocks=KB)
@@ -1969,3 +2073,319 @@ def test_direct_slot_merge_equals_the_scan(device, recipes, S):
     for out in outs[:-1]:
         for k in ("out", "m", "lc"):
             np.testing.assert_array_equal(out[k], outs[-1][k])
+
+
+@pytest.mark.parametrize("groups", [2, 4, 8, 16], ids=["g2", "g4", "g8", "g16"])
+@pytest.mark.parametrize("T", [1, 5, 32, 64, 128, 512, 1024, 2048],
+                         ids=["T1", "T5", "T32", "T64", "T128", "T512", "T1024", "T2048"])
+def test_tiled_index_selection_matches_full(device, recipes, T, groups):
+    """The tiled index selection lists exactly what one pass over every key does.
+
+    ``index_merge_graph`` merges a group's own 2048-key rows with the running top entries of the groups before
+    it (ds_ix_merge), so a column's 512 positions, their order and its count must equal ix_thr / ix_bcnt /
+    ix_list over the whole (kmax, T) score buffer — for one column, for five (a member count above one) and for
+    sixty-four (one member per column), over columns that see everything, most of it, a middle amount, and
+    amounts that are not a multiple of 64. A column whose list starts mid-vector is the case a partial-vector
+    store gets wrong when its coordinate is the vector's base row instead of its first slot, so these columns
+    list a count that is not a multiple of 64 (distinct scores: 511 strict + 1 tie, or `vis` entries). The last
+    group's running set is checked too: each listed entry's score sits at its slot, and no slot past the count
+    holds a listed score. RED-first: the same comparison is made after one listed entry's score is dropped, and
+    the tiled result must then differ from the first one (the gate sees a change of a single selected index)."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+    from resin_models_gaudi.synapse.graph import Graph
+    from resin_models_gaudi.synapse.runtime import F32, I32
+
+    d = L.Dims(
+        hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+        experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+        route_scale=1.5, ranks=1,
+    )  # fmt: skip
+    rng = np.random.default_rng(7)
+    run, rows = L.INDEX_RUN, L.INDEX_TILE
+    K = rows * groups
+    # columns that see everything, most of it, a middle amount, and amounts that are not a multiple of 64
+    pattern = np.array([K, 5000, 900, 700, 3000, 1500], np.int32)
+    vis = np.minimum(np.resize(pattern, T), K).astype(np.int32)
+    # a graph tensor's shape is fastest dimension first, so a (rows, T) score tensor is a (T, rows) array
+    score = rng.standard_normal((T, K)).astype(np.float32)
+    for t in range(T):
+        score[t, vis[t] :] = -3.0e38  # past a column's visible entries
+    full = Graph(device, "t_ds41_ix_full")
+    sc, V = full.input("score", (K, T), F32), full.input("vis", (T,), I32)
+    fthr = full.tensor((64, T), I32)
+    full.node("rg_ix_thr_f32", [sc, V], [fthr], struct.pack("i", run))
+    fcnt, fgsum = full.tensor((K // 64, T), I32), full.tensor((-(-K // 4096), T), I32)
+    full.node("rg_ix_bcnt_f32", [sc, V, fthr], [fcnt, fgsum])
+    full.node(
+        "rg_ix_list_f32",
+        [sc, V, fthr, fcnt, fgsum],
+        [full.input("list", (run, T), I32), full.input("lslots", (8, T), I32)],
+        struct.pack("iii", max(1, 48 // T), run, d.heads),
+    )
+    tiled = L.index_merge_graph(device, d, T, rows, run, heads=d.heads)
+    merge = [device.malloc(4 * (run + rows) * T) for _ in range(2)]
+    pos = [device.malloc(4 * run * T) for _ in range(2)]
+    one = {n: device.malloc(4 * T) for n in ("vis", "exact")}
+    base, thr = device.malloc(4), device.malloc(4 * 64 * T)
+    out = {n: device.malloc(4 * run * T) for n in ("list", "sout")}
+    slots = device.malloc(4 * 8 * T)
+    full_addr = {
+        "score": device.malloc(4 * K * T),
+        "vis": device.malloc(4 * T),
+        "list": device.malloc(4 * run * T),
+        "lslots": device.malloc(4 * 8 * T),
+    }
+    try:
+        full_recipe = recipes.compile(full)
+
+        def run_full(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            device.h2d(full_addr["score"], np.ascontiguousarray(scores))
+            device.h2d(full_addr["vis"], vis)
+            for name in full_recipe.persistent:
+                full_recipe.bind(name, full_addr[name])
+            full_recipe.launch()
+            device.sync()
+            return (
+                device.d2h(full_addr["list"], (T, run), np.int32),
+                device.d2h(full_addr["lslots"], (T, 8), np.int32),
+            )
+
+        def run_tiled(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            recipe = recipes.compile(tiled)
+            for g in range(groups):
+                # the merge buffer is a (run + rows, T) tensor, so a column's rows are contiguous and a group's
+                # tile is one block of `rows` floats per column (a whole (T, rows) upload would put column 1's
+                # rows at column 0's — exact at T=1, wrong above it; the model does the same copy on the device)
+                row0 = 0 if g == 0 else run
+                for t in range(T):
+                    device.h2d(
+                        merge[g % 2] + 4 * (t * (run + rows) + row0),
+                        np.ascontiguousarray(scores[t, g * rows : (g + 1) * rows]),
+                    )
+                # the group's visible rows and the column's count are derived by ix_gvis from the column's
+                # visible entries and the group's first key: the test feeds those two, as the model does
+                device.h2d(one["vis"], vis)
+                device.h2d(base, np.array([g * rows], np.int32))
+                bind = {
+                    "ix_merge": merge[g % 2],
+                    "ix_vis": one["vis"],
+                    "ix_pos": pos[g % 2],
+                    "ix_gbase": base,
+                    "ix_thr": thr,
+                    "ix_lslots": slots,
+                    "ix_list": out["list"],
+                    "ix_sout": merge[1 - g % 2],
+                    "ix_pos_out": pos[1 - g % 2],
+                }
+                for name in recipe.persistent:
+                    recipe.bind(name, bind[name])
+                recipe.launch()
+                device.sync()
+            return (
+                device.d2h(out["list"], (T, run), np.int32),
+                device.d2h(slots, (T, 8), np.int32),
+            )
+
+        want, want_slots = run_full(score)
+        got, got_slots = run_tiled(score)
+        for t in range(T):
+            n = int(want_slots[t, 4])
+            assert n == min(int(vis[t]), run), (t, n, int(vis[t]))
+            assert int(got_slots[t, 4]) == n, (t, got_slots[t, 4], n)
+            a, b = got[t, :n].tolist(), want[t, :n].tolist()
+            if a != b:
+                print(
+                    "DIAG t", t, "vis", int(vis[t]), "n", n, "setdiff", len(set(a) ^ set(b)),
+                    "only_tiled", sorted(set(a) - set(b))[:8],
+                    "only_full", sorted(set(b) - set(a))[:8],
+                    "first_diff", next((i for i in range(n) if a[i] != b[i]), None),
+                )  # fmt: skip
+            assert a == b, (t, a[:12], b[:12])
+            # the strict entries, then the ties, each ascending by position: no key twice, and the tie run is the
+            # trailing one (the listed scores are >= the threshold, so the ties are the run at the minimum)
+            assert len(set(a)) == n, ("a key listed twice", t)
+            listed = score[t, a]
+            tie = listed == listed.min()
+            split = int(np.argmax(tie)) if tie.any() else n
+            assert np.all(tie[split:]) and not np.any(tie[:split]), (t, split)
+            assert a[:split] == sorted(a[:split]) and a[split:] == sorted(a[split:]), t
+        # the last group's running set: each listed entry's score at its slot, and no listed slot past the count
+        sout = device.d2h(merge[(groups - 1) % 2 ^ 1], (T, run + rows), np.float32)[:, :run]
+        for t in range(T):
+            n = int(got_slots[t, 4])
+            assert sout[t, :n].tolist() == score[t, got[t, :n]].tolist(), t
+            assert np.all(sout[t, n:] == np.float32(-3.0e38)), (t, sout[t, n : n + 4])
+        # RED: drop one listed entry's score and both selections must change, identically
+        dropped = score.copy()
+        victim = int(want[0, 0])
+        dropped[0, victim] = -3.0e38
+        want2, _ = run_full(dropped)
+        got2, _ = run_tiled(dropped)
+        assert got2[0, :run].tolist() == want2[0, :run].tolist()
+        assert got2[0, :run].tolist() != got[0, :run].tolist(), (
+            "the gate cannot see a selected entry change"
+        )
+        print("tiled selection == full selection on", T, "columns of", K, "keys")
+    finally:
+        for a in [
+            *merge,
+            *pos,
+            *one.values(),
+            base,
+            thr,
+            *out.values(),
+            slots,
+            *full_addr.values(),
+        ]:
+            device.free(a)
+
+
+def test_tiled_index_selection_pads_the_running_set(device, recipes):
+    """One merge group, a column that sees fewer keys than `run`: the slots past its count are padded with
+    NINF / -1 at their own rows, so the next group's merge ranks them last. (Only the count decides how many
+    slots a later merge may list, and the padding is what keeps an unlisted row out of the top `run`.)"""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+
+    d = L.Dims(
+        hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+        experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+        route_scale=1.5, ranks=1,
+    )  # fmt: skip
+    run, rows, seen = L.INDEX_RUN, L.INDEX_TILE, 300
+    score = np.zeros((1, run + rows), np.float32)
+    score[0, :seen] = -np.arange(seen)
+    g = L.index_merge_graph(device, d, 1, rows, run, heads=d.heads)
+    merge = [device.malloc(4 * (run + rows)) for _ in range(2)]
+    pos = [device.malloc(4 * run) for _ in range(2)]
+    one = {n: device.malloc(4) for n in ("vis", "exact")}
+    base, thr = device.malloc(4), device.malloc(4 * 64)
+    out = {n: device.malloc(4 * run) for n in ("list", "sout")}
+    slots = device.malloc(4 * 8)
+    recipe = recipes.compile(g)
+    try:
+        device.h2d(one["vis"], np.array([seen], np.int32))
+        device.h2d(base, np.array([0], np.int32))
+        device.h2d(merge[0], np.ascontiguousarray(score[:, :rows]))
+        for name in recipe.persistent:
+            recipe.bind(
+                name,
+                {
+                    "ix_merge": merge[0],
+                    "ix_vis": one["vis"],
+                    "ix_pos": pos[0],
+                    "ix_gbase": base,
+                    "ix_thr": thr,
+                    "ix_lslots": slots,
+                    "ix_list": out["list"],
+                    "ix_sout": merge[1],
+                    "ix_pos_out": pos[1],
+                }[name],
+            )
+        recipe.launch()
+        device.sync()
+        assert int(device.d2h(slots, (1, 8), np.int32)[0, 4]) == seen
+        listed = device.d2h(out["list"], (1, run), np.int32)[0]
+        assert listed[:seen].tolist() == list(range(seen))
+        sout = device.d2h(merge[1], (1, run + rows), np.float32)[0, :run]
+        pout = device.d2h(pos[1], (1, run), np.int32)[0]
+        assert np.all(sout[seen:] == np.float32(-3.0e38)), sout[seen - 2 : seen + 2]
+        assert np.all(pout[seen:] == -1), pout[seen - 2 : seen + 2]
+        print("the running set pads slots", seen, "..", run - 1, "with NINF / -1")
+    finally:
+        for a in [*merge, *pos, *one.values(), base, thr, *out.values(), slots]:
+            device.free(a)
+        g.destroy()
+
+
+@pytest.mark.parametrize("prefill", [True, False], ids=["prefill", "decode"])
+def test_index_group_tables_are_built_on_the_device(device, recipes, prefill):
+    """ds_ix_gslot derives every merge group's slot records and its first key from the step's O(T) ``blk``, so
+    the host fill builds no per-group table. The records must equal the arithmetic the fill used to do: group g's
+    launch j, slot rg = j*slots + s is query block b = rg % nblk of tile g*tp + rg / nblk, with key0 the tile's
+    first key in the group's merge buffer (0 for tile 0, else run + (tile - g*tp) * keys), key1 = key0 + len,
+    len = clamp(seen - tile*keys, 0, keys) from the block's last column, lane 7 the tile's first index page, and
+    a slot whose tile holds no visible key is lane 0 = -1. RED-first: one block's seen count moves and the
+    records must change with it."""
+    from resin_models_gaudi.deepseek_v41 import layers as L
+
+    d = L.Dims(
+        hidden=256, heads=2, head_dim=512, q_lora=64, o_lora=64, groups=1, expert=64,
+        experts=4, top=2, vocab=1024, eps=1e-20, hc_iters=2, hc_eps=1e-6, limit=10.0,
+        route_scale=1.5, ranks=1,
+    )  # fmt: skip
+    T, qb = 64, (8 if prefill else 1)
+    nblk = T // qb
+    slots, lpg, tp, ratio, groups = 4, (1 if prefill else 2), 2, 1, 3
+    keys, run, page = L.INDEX_TILE, L.INDEX_RUN, 128
+    S2 = lpg * slots
+    rng = np.random.default_rng(11)
+    # every block's first position and the entries its last column sees: some blocks see nothing of a tile
+    # the table's view is (T, 2) -- the graph tensor is (2, T), lane 0 the position, lane 1 the count -- and its
+    # row is the QUERY BLOCK index, which is what the fill writes: block b covers columns b*qb .. b*qb + qb - 1,
+    # so row b*qb is block 0's row only when qb == 1 (a decode step).  Writing block b's entry at row b*qb (the
+    # column) is the bug this gate exists to catch.
+    blk = np.zeros((T, 2), np.int32)
+    blk[:nblk, 0] = rng.integers(0, 4096, nblk)
+    blk[:nblk, 1] = rng.integers(0, 5000, nblk)
+
+    def want(block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        rec = np.zeros((groups * S2, 8), np.int64)
+        rec[:, 0] = -1
+        gb = np.zeros(groups, np.int64)
+        for g in range(groups):
+            gb[g] = g * tp * keys
+            for rg in range(S2):
+                b, tile = rg % nblk, g * tp + rg // nblk
+                first, c0 = tile * keys, b * qb
+                ln = min(max(int(block[b, 1]) - first, 0), keys)
+                if ln <= 0:
+                    continue
+                key0 = (tile - g * tp) * keys  # tile-local for every group (the merge copy adds the run offset)
+                rec[g * S2 + rg] = [
+                    0, L.INDEX_HEADS * c0, int(block[b, 0]), key0, key0 + ln, c0, ratio,
+                    first // page,
+                ]  # fmt: skip
+        return rec, gb
+
+    g = L.index_gslot_graph(device, d, T, slots, lpg, tp, nblk, qb, ratio, groups, keys, run, page)
+    addr = {
+        "blk": device.malloc(8 * T),
+        "ix_rec": device.malloc(4 * 8 * groups * S2),
+        "ix_gbase": device.malloc(4 * 64 * groups),
+    }
+    recipe = recipes.compile(g)
+    try:
+
+        def go(block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            device.h2d(addr["blk"], np.ascontiguousarray(block))
+            for name in recipe.persistent:
+                recipe.bind(name, addr[name])
+            recipe.launch()
+            device.sync()
+            return (
+                device.d2h(addr["ix_rec"], (groups * S2, 8), np.int32),
+                device.d2h(addr["ix_gbase"], (groups, 64), np.int32)[:, 0],
+            )
+
+        got, got_gb = go(blk)
+        rec, gb = want(blk)
+        np.testing.assert_array_equal(got, rec)
+        np.testing.assert_array_equal(got_gb, gb)
+        # every group's slot records carry their own tile's keys, and a slot past a column's visible entries is
+        # the padding record (lane 0 = -1) the launches read as "no keys"
+        assert (got[:, 0] == -1).any() and (got[:, 0] == 0).any()
+        # every block of tile 0 sees a key, so every one of the first S2 records must be live: a kernel that
+        # reads the wrong row of blk produces all-padding records and cannot pass this
+        assert np.all(got[:S2, 0] == 0), got[:S2, 0].tolist()
+        # RED: move one block's seen count and the records must follow
+        moved = blk.copy()
+        moved[0, 1] += 3 * keys
+        got2, _ = go(moved)
+        rec2, _ = want(moved)
+        np.testing.assert_array_equal(got2, rec2)
+        assert not np.array_equal(got2, got), "the gate cannot see a block's seen count change"
+        print("ds_ix_gslot built", groups * S2, "slot records of", groups, "groups on the device")
+    finally:
+        for a in addr.values():
+            device.free(a)
+        g.destroy()
