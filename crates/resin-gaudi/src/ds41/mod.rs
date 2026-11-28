@@ -429,7 +429,7 @@ pub fn fill_prep(
     let mut pos = vec![0i64; t];
     pos[..n].copy_from_slice(positions);
     let mut prof = FillProf::new();
-    prep_tables(tables, host, &pos, cs_all, &mut prof)
+    prep_tables(tables, host, &pos, n, cs_all, &mut prof)
 }
 
 /// `fill` over a host copy whose position-only tables were written by `fill_prep` (same `positions`).
@@ -467,6 +467,7 @@ fn prep_tables(
     tables: &Tables,
     host: &mut [u8],
     pos: &[i64],
+    real: usize,
     cs_all: [&[f32]; 2],
     prof: &mut FillProf,
 ) -> Result<(), String> {
@@ -478,9 +479,14 @@ fn prep_tables(
         host[lo..hi].fill(0);
     }
     let mut w = words(host, tables.nbytes)?;
-    let n = pos.len();
+    // `meta` is (pos0, n_real): the step's REAL column count, not the bucket's. `pos` is padded to the
+    // bucket with zeros so the rope tables cover every column the step's graphs touch, but the columns past
+    // `n_real` are padding, and the MoE's `moe_cnt`/`moe_route` mask them (`t >= meta[1]` gets ids -1 and
+    // weight 0). Writing the bucket size here made every step route its padding columns' experts: a batch-3
+    // decode step in a T=4 bucket paid 4/3 of the expert pages it needed, 8/5 at batch 5, and a prefill
+    // chunk's bucket tail (up to 2047 of 2048 columns) was routed as real tokens.
     w.set(tables.meta, 0, pos[0]);
-    w.set(tables.meta, 1, n as i64);
+    w.set(tables.meta, 1, real as i64);
     w.set(tables.meta, 2, 0);
     w.set(tables.meta, 3, 0);
     for r in 0..2 {
@@ -533,7 +539,7 @@ fn fill_impl(
     } else {
         let mut pos = vec![0i64; t];
         pos[..n].copy_from_slice(positions);
-        prep_tables(tables, host, &pos, cs_all, &mut prof)?;
+        prep_tables(tables, host, &pos, n, cs_all, &mut prof)?;
     }
     let mut w = words(host, tables.nbytes)?;
     let qb = tables.qb.max(1);
