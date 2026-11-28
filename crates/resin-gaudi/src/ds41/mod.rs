@@ -21,14 +21,6 @@ pub const INDEX_RUN: i64 = 512;
 pub const PENDING_SLOTS: i64 = 4;
 const ROPE: usize = 128;
 
-/// `RESIN_DS41_HOST_ZERO=1`: the fill zeroes the host copy's not-written-whole ranges itself (the old
-/// behaviour). Default off: the io program clears them on the device after the upload, so the zeroing is not
-/// on the host critical path.
-fn host_zero() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RESIN_DS41_HOST_ZERO").map(|v| v == "1").unwrap_or(false))
-}
-
 /// Env-gated (`RESIN_DS41_FILL_PROF=1`) per-section fill timers (stderr, once per fill). Off: one branch.
 struct FillProf {
     on: bool,
@@ -478,14 +470,12 @@ fn prep_tables(
     cs_all: [&[f32]; 2],
     prof: &mut FillProf,
 ) -> Result<(), String> {
-    // The not-written-whole ranges. Cleared on the device by default (the io program's memsets after the
-    // upload, `deepseek_v41/native.py`), which takes the zeroing off the host critical path: a host zeroing
-    // pass was 40-49 ms of every prefill chunk with the device idle (FILL_PROF `prep`). `RESIN_DS41_HOST_ZERO=1`
-    // keeps the old host zeroing for an A/B.
-    if host_zero() {
-        for &(lo, hi) in &tables.zero {
-            host[lo..hi].fill(0);
-        }
+    // The not-written-whole ranges, cleared before the writes below (so the fill's own partial writes into
+    // them survive). This pass is cheap only because `Tables::zero` is small: it is the image minus the
+    // tables the fill writes whole, ~0.8 MB of a 116 MB host-Engram prefill image, and the table families
+    // that used to dominate it are now excluded (`_Tables.zero` in `deepseek_v41/model.py`).
+    for &(lo, hi) in &tables.zero {
+        host[lo..hi].fill(0);
     }
     let mut w = words(host, tables.nbytes)?;
     let n = pos.len();
@@ -1635,12 +1625,11 @@ mod tests {
     }
 
     #[test]
-    fn the_fill_leaves_the_zero_ranges_to_the_device_by_default() {
-        // The io program clears the not-written-whole ranges on the device (native._device_zero), so `fill`
-        // must NOT touch them: a poisoned range survives the fill. With `RESIN_DS41_HOST_ZERO=1` the old
-        // host pass is restored and the same range is cleared — so this gate is RED on that arm, by design:
-        // it pins the default, and the env is the A/B control.
-        let host_zeroing = std::env::var("RESIN_DS41_HOST_ZERO").is_ok_and(|v| v == "1");
+    fn the_fill_clears_the_zero_ranges_before_it_writes() {
+        // `fill` clears the not-written-whole ranges itself, BEFORE its own writes, so a table it writes
+        // only partly (blk, tok, the pending groups) keeps those writes. A device-side clear after the
+        // upload cannot do that — it would wipe them — and that is what `f07d5dc` shipped: it memset the
+        // whole complement of the wholly-written tables, i.e. most of the image, after the upload.
         let model = Model {
             heads: 8,
             index_heads: 32,
@@ -1704,13 +1693,10 @@ mod tests {
         let mut host = vec![0xABu8; 200000];
         fill(&model, &tables, &mut host, &rows, &(0..32).collect::<Vec<i64>>(), None, false, None,
              [&cs, &cs], &[]).unwrap();
-        // the range the device clears is left exactly as it was (or cleared, on the host-zero arm)
-        if host_zeroing {
-            assert!(host[150000..160000].iter().all(|&b| b == 0));
-        } else {
-            assert!(host[150000..160000].iter().all(|&b| b == 0xAB));
-        }
-        // and the fill still wrote its own tables (so this is a moved zero, not a missing one)
+        // the range is cleared...
+        assert!(host[150000..160000].iter().all(|&b| b == 0));
+        // ...and the fill still wrote its own tables, including the bytes it writes into a zero range
+        // (blk's 32 query-block records are inside one): the clear comes first, so they survive.
         let word = |off: usize| i32::from_le_bytes(host[off..off + 4].try_into().unwrap());
         assert_eq!(word(tables.blk[0] + 4), 32);
     }

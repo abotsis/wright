@@ -316,8 +316,24 @@ class _Tables:
                 "cmp_blocks1", "cmp_blocks2",
                 "ix1.rec", "ix2.rec", "ix1.gb", "ix2.gb",
                 *(f"win_pos.{layer}" for layer in range(layers)),
-            )
-        )  # fmt: skip
+                # and the tables _fill writes whole on every step, so zeroing them is pure cost: the rope
+                # tables and their inverses, the compressor's rope, the per-layer row tables, the compressor's
+                # latches and the visible-key counts. Under host Engram the embedding tables are the rest of
+                # it: 100 MB of a 116 MB prefill image, written whole by the threaded gather
+                # (`engram_gather_threaded`, one column range per worker, all `t` columns; the Rust gate
+                # `engram_gather_host` compares the whole region against its oracle).
+                #
+                # What is left is the tables the fill writes only sometimes or only partly (a prepared step's
+                # tokens, the sparse arm's records, the engram hashes, the query-block and pending-group
+                # tables, the compressor's slots), ~1 MB of a 15.8 MB card-Engram image.
+                # `test_the_fill_leaves_only_zero_ranges_untouched` pins the invariant this rests on: every
+                # byte the fill leaves untouched is either inside `zero` or written by the device.
+                "cs0", "cs1", "cs0_inv", "cs1_inv", "cs_g1", "cs_g2", "ix_vis1", "ix_vis2",
+                *(f"{kind}.{layer}" for kind in ("rows", "lat") for layer in range(layers)),
+                *((f"eg.{layer}" for layer in model.engram_layers) if model.engram == "host" else ()),
+            )  # fmt: skip
+            if n in self.spec
+        )
         self.zero, a = [], 0
         for lo, hi in whole:
             self.zero.append((a, lo))
